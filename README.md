@@ -1,5 +1,10 @@
 # fastjsd
 
+[![PyPI version](https://img.shields.io/pypi/v/fastjsd.svg)](https://pypi.org/project/fastjsd/)
+[![Python versions](https://img.shields.io/pypi/pyversions/fastjsd.svg)](https://pypi.org/project/fastjsd/)
+[![Tests](https://github.com/briankeithn/fastjsd/actions/workflows/ci.yml/badge.svg)](https://github.com/briankeithn/fastjsd/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Fast, exact, pairwise Jensen-Shannon distance matrices for Python.
 
 `fastjsd` computes the full `n x n` matrix of Jensen-Shannon distances between
