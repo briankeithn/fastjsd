@@ -1,0 +1,96 @@
+
+================================================================================================
+SINGLE THREAD -- the like-for-like comparison.
+SciPy's pdist is a scalar single-threaded C loop, so this is the
+row where nothing is being credited to parallelism. Read it first.
+numba threads: 1   (NUMBA_NUM_THREADS=4)
+reps=7, interleaved round-robin
+
+case                                scipy    Lee-97   fastjsd      scipy x  Lee-97 x
+------------------------------------------------------------------------------------
+costing (one warm call each) ...
+costing took 44s; 17 cases, estimated 5.9 min of timed work
+    synth n=2048 k=16   dense              ~  15.9s
+    synth n=2048 k=16   z=4 (25.0% nz)     ~   4.9s
+    synth n=2048 k=64   dense              ~  42.2s
+    synth n=2048 k=64   z=16 (25.0% nz)    ~  16.2s
+    synth n=2048 k=64   z=4 (6.2% nz)      ~   5.4s
+    synth n=2048 k=256  dense              ~ 166.8s
+    synth n=2048 k=256  z=16 (6.2% nz)     ~  21.8s
+    synth n=2048 k=256  z=4 (1.6% nz)      ~   9.9s
+    synth n=2048 k=16   z~4 cv=0.8         ~   5.4s
+    synth n=2048 k=64   z~16 cv=0.8        ~  14.2s
+    synth n=2048 k=64   z~4 cv=0.8         ~   5.8s
+    synth n=2048 k=256  z~16 cv=0.8        ~  19.6s
+    synth n=2048 k=256  z~4 cv=0.8         ~  10.4s
+    real n=931 k=25 dense                  ~   3.9s
+    real n=931 k=25 thresholded (24% nz)   ~   0.8s
+    real n=1014 k=40 dense                 ~   7.4s
+    real n=1014 k=40 thresholded (12% nz)  ~   0.9s
+
+
+SYNTHETIC -- the primary grid
+synth n=2048 k=16   dense           546.1     555.6     249.3        2.19x     2.11x
+                                 [   5%]  elapsed  0.3m  eta  5.4m
+synth n=2048 k=16   z=4 (25.0% nz)     328.4     132.4      61.2        5.06x     2.14x
+                                 [   6%]  elapsed  0.3m  eta  5.6m
+synth n=2048 k=64   dense          1997.1    2157.6     877.0        2.50x     2.39x
+                                 [  18%]  elapsed  1.2m  eta  5.7m
+synth n=2048 k=64   z=16 (25.0% nz)    1278.1     574.1     145.7        8.77x     3.90x
+                                 [  23%]  elapsed  1.6m  eta  5.5m
+synth n=2048 k=64   z=4 (6.2% nz)     539.9      94.6      51.1       10.16x     1.86x
+                                 [  24%]  elapsed  1.7m  eta  5.4m
+synth n=2048 k=256  dense          8088.9    8416.8    3449.3        2.26x     2.39x
+                                 [  72%]  elapsed  5.2m  eta  2.1m
+synth n=2048 k=256  z=16 (6.2% nz)    2291.0     454.3      88.2       25.35x     5.06x
+                                 [  78%]  elapsed  5.6m  eta  1.6m
+synth n=2048 k=256  z=4 (1.6% nz)    1236.5      84.6      33.9       33.17x     2.41x
+                                 [  81%]  elapsed  5.8m  eta  1.4m
+synth n=2048 k=16   z~4 cv=0.8      316.8     125.4      58.6        5.15x     2.11x
+                                 [  82%]  elapsed  5.9m  eta  1.3m
+synth n=2048 k=64   z~16 cv=0.8    1190.8     487.6     140.8        8.26x     3.35x
+                                 [  86%]  elapsed  6.2m  eta  1.0m
+synth n=2048 k=64   z~4 cv=0.8      542.8     104.5      36.1       12.33x     2.74x
+                                 [  88%]  elapsed  6.3m  eta  0.9m
+synth n=2048 k=256  z~16 cv=0.8    2009.2     388.2      85.0       24.73x     4.42x
+                                 [  93%]  elapsed  6.7m  eta  0.5m
+synth n=2048 k=256  z~4 cv=0.8     1226.8      91.3      39.6       29.19x     2.28x
+                                 [  96%]  elapsed  7.0m  eta  0.3m
+
+CASE STUDY -- real HDBSCAN memberships
+real n=931 k=25 dense               211.1     165.5      86.8        2.43x     1.87x
+                                 [  97%]  elapsed  7.1m  eta  0.2m
+real n=931 k=25 thresholded (24% nz)      65.5      20.7      11.3        5.71x     1.81x
+                                 [  98%]  elapsed  7.1m  eta  0.2m
+real n=1014 k=40 dense              402.5     284.0     186.5        2.14x     1.52x
+                                 [ 100%]  elapsed  7.2m  eta  0.0m
+real n=1014 k=40 thresholded (12% nz)      92.3      19.9       9.4        8.93x     2.10x
+                                 [ 100%]  elapsed  7.2m  eta  0.0m
+
+AGREEMENT with scipy, worst case   0.0e+00   7.0e-13   8.3e-13
+  This row is AGREEMENT WITH SCIPY, which is not accuracy. fastjsd is
+  more accurate than scipy near coincidence (well_conditioned is on
+  by default for the merge), so improving accuracy INCREASES this
+  number: the closer this kernel gets to the true value, the further
+  it sits from scipy's. bench/accuracy.py measures against 50-digit
+  truth, which is the metric that means something.
+  pynndescent adds FLOAT32_EPS to EVERY coordinate: it computes a
+  smoothed divergence, not this one, and the deviation grows with the
+  number of zeros. Reported, not excluded -- see baselines.py.
+  sklearn is not timed: it has no compiled JS metric, so the only
+  route is a per-pair Python callable. That measures interpreter
+  round-trips, not an implementation -- see baselines.py.
+
+SYNTHETIC -- the primary grid
+  fastjsd vs scipy                 :     2.19x -    33.17x   (what practitioners run)
+  fastjsd vs Lee-1997              :     1.86x -     5.06x   (the published identity, same harness)
+
+CASE STUDY -- real HDBSCAN memberships
+  fastjsd vs scipy                 :     2.14x -     8.93x   (what practitioners run)
+  fastjsd vs Lee-1997              :     1.52x -     2.10x   (the published identity, same harness)
+
+identical rows (the difference the timing cannot show):
+  (not installed, skipped: pynndescent)
+  fastjsd          exactly 0.0 in all 96
+  Lee-1997 sparse  NONZERO in 30/96, max 3.58e-08
+  scipy            exactly 0.0 in all 96

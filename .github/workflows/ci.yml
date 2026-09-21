@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: py${{ matrix.python }} ${{ matrix.extras }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        extras: ["test"]
+        include:
+          # The pure-NumPy backends must work with no Numba installed at all.
+          - os: ubuntu-latest
+            python: "3.12"
+            extras: "numpy-only"
+          # Different libm and code generator: the exact-zero guarantee is a
+          # property of one of each until it is checked against another.
+          - os: macos-latest
+            python: "3.12"
+            extras: "test"
+          - os: windows-latest
+            python: "3.12"
+            extras: "test"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ matrix.extras }}" = "numpy-only" ]; then
+            pip install -e . pytest scipy
+          else
+            pip install -e ".[test]"
+          fi
+      - name: Test
+        shell: bash
+        run: pytest -q

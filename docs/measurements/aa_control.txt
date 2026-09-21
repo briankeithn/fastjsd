@@ -1,0 +1,36 @@
+What is the smallest ratio this harness can actually resolve?
+
+A/A control: jsd_matrix vs jsd_matrix, 25 duels per cell, 1 thread(s).
+True ratio is exactly 1.000 by construction. Everything printed is noise.
+
+case                                              ms   median     IQR   p10-p90  min/min    pos  verdict
+--------------------------------------------------------------------------------------------------------------
+synth n=2048 k=16   dense [100% nz]            245.5    0.998    2.2%      5.4%    1.005  0.996  tie-band 2.2%  (coarse)
+synth n=2048 k=16   z=4 (25.0% nz) [25% nz]     56.7    0.999    3.3%      5.8%    0.986  1.001  tie-band 3.3%  (coarse)
+synth n=2048 k=64   dense [100% nz]            877.3    1.004    1.7%      4.3%    1.001  1.004  tie-band 1.7%
+synth n=2048 k=64   z=16 (25.0% nz) [25% nz]   145.3    1.003    2.9%      4.3%    0.996  0.998  tie-band 2.9%  (coarse)
+synth n=2048 k=64   z=4 (6.2% nz) [6% nz]       50.2    1.001    1.4%      4.6%    0.995  0.999  tie-band 1.4%
+synth n=2048 k=256  dense [100% nz]           3357.6    0.996    2.4%      5.6%    0.987  0.996  tie-band 2.4%  (coarse)
+synth n=2048 k=256  z=16 (6.2% nz) [6% nz]      83.6    1.004    1.5%      3.1%    1.004  0.997  tie-band 1.5%
+synth n=2048 k=256  z=4 (1.6% nz) [2% nz]       31.6    0.999    1.2%      2.8%    1.002  0.998  tie-band 1.2%
+synth n=2048 k=16   z~4 cv=0.8 [25% nz]         56.3    1.000    3.5%      6.0%    1.000  0.996  tie-band 3.5%  (coarse)
+synth n=2048 k=64   z~16 cv=0.8 [25% nz]       140.6    0.995    3.1%      6.0%    0.986  1.005  tie-band 3.1%  (coarse)
+synth n=2048 k=64   z~4 cv=0.8 [7% nz]          33.4    1.007    1.1%      2.8%    1.011  1.002  tie-band 1.1%
+synth n=2048 k=256  z~16 cv=0.8 [6% nz]         79.6    0.996    1.6%      6.3%    0.995  1.004  tie-band 1.6%
+synth n=2048 k=256  z~4 cv=0.8 [2% nz]          38.0    0.997    0.9%      3.1%    0.996  1.000  tie-band 0.9%
+real n=931 k=25 dense [100% nz]                 86.0    0.998    1.6%      4.0%    0.987  1.000  tie-band 1.6%
+real n=931 k=25 thresholded/uniform [24% nz]    11.4    0.999    1.7%      4.6%    1.017  1.003  tie-band 1.7%
+real n=931 k=25 thresholded/argmax [9% nz]       7.4    1.004    1.8%      5.7%    1.003  1.002  tie-band 1.8%
+real n=1014 k=40 dense [100% nz]               188.5    0.999    1.1%      3.7%    1.003  1.001  tie-band 1.1%
+real n=1014 k=40 thresholded/uniform [12% nz]     9.2    1.003    1.0%      2.7%    0.996  0.998  tie-band 1.0%
+real n=1014 k=40 thresholded/argmax [8% nz]      8.9    1.002    1.8%      3.3%    1.009  1.003  tie-band 1.8%
+
+------------------------------------------------------------------------------------------------------------
+worst tie-band across cells : 3.5%
+worst median bias from 1.000: 0.7%
+
+How to use this: a ratio reported by bench_honest.py is only a
+result if it sits outside its own cell's tie-band. Compare every
+margin over a baseline against the band for the same cell on this
+machine; a margin narrower than the band is a tie, whatever the
+ratio itself looks like.

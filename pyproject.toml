@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastjsd"
+version = "0.1.0"
+description = "Fast exact pairwise Jensen-Shannon distance matrices"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Brian Keith-Norambuena" }]
+keywords = [
+    "jensen-shannon",
+    "distance-matrix",
+    "information-theory",
+    "sparse",
+    "numba",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+numba = ["numba>=0.58"]
+test = ["pytest", "scipy", "numba>=0.58"]
+bench = ["pytest", "scipy", "numba>=0.58", "mpmath", "psutil"]
+
+[project.urls]
+Homepage = "https://github.com/briankeithn/fastjsd"
+Source = "https://github.com/briankeithn/fastjsd"
+Issues = "https://github.com/briankeithn/fastjsd/issues"
+
+[tool.setuptools.packages.find]
+include = ["fastjsd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Pinned explicitly, because ruff's built-in default selection is broad and
+# changes over time: leaving this unset makes `ruff check` depend on which
+# ruff a contributor happens to have installed.
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+# `bench/*.py` must import `_bootstrap` before anything that pulls in the
+# package, because that import is what puts the repository root on sys.path.
+# Ruff's ordering already places it correctly; this pins the classification
+# so a future change to first-party detection cannot silently reorder it.
+known-first-party = ["fastjsd"]
+known-local-folder = ["_bootstrap", "_machine", "baselines", "datasets"]

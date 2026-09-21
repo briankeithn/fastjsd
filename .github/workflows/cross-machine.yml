@@ -1,0 +1,228 @@
+name: cross-machine benchmark (manual)
+
+# Manual dispatch only, deliberately. These runners are shared, oversubscribed
+# cloud VMs whose clock rate, core count and neighbours are invisible from
+# inside the guest, so a millisecond measured here does not mean the same thing
+# twice in a row, let alone on two different boxes. A gate built on them would
+# flap forever. Run it on demand.
+#
+# WHAT THIS CAN AND CANNOT MEASURE -- read before quoting any of it.
+#
+# It CANNOT measure:
+#   * Absolute milliseconds. `ubuntu-24.04` is a label, not a machine: the pool
+#     mixes several Intel and AMD microarchitectures. That is why the label
+#     appears three times below under three leg ids. Times are recorded only so
+#     ratios can be recomputed and audited.
+#   * "The" speedup over SciPy. SciPy's pdist is single-threaded and these
+#     kernels are parallel, so the ratio scales with the runner's usable cores.
+#   * Thread scaling. Two to four vCPUs that may be SMT siblings on a shared
+#     host is not a scaling study.
+#   * The dispatch crossover density. Near the crossover the kernels are within
+#     noise of each other by definition. What travels is the regret from using
+#     the shipped threshold against each box's own optimum.
+#   * Anything about the numba-svml backend: Intel SVML is x86-only and is not
+#     on PyPI, so every figure here is the libm path.
+#
+# It CAN measure:
+#   * The DIRECTION of every claim across genuinely different silicon, libm and
+#     toolchains: a sign test over boxes, where the box is the unit of
+#     independence.
+#   * Ratios against the published sparse form, which is the good cross-box
+#     quantity -- same Numba, same harness, same schedule, same thread count,
+#     so clock rate and core count divide out. Reported with its own spread and
+#     as "indistinguishable" whenever that spread straddles 1.0.
+#   * The exactness guarantees, which are deterministic and DO travel: accuracy
+#     against 50-digit mpmath, and duplicate rows giving exactly 0.0. That last
+#     depends on a bitwise cancellation, which is a property of one libm and one
+#     code generator until checked against another. These are the highest-value
+#     output of the whole exercise.
+#   * Whether the package degrades correctly where numba, scipy or a wheel is
+#     simply absent.
+#
+# bench/CROSS_MACHINE.md is the operator's guide.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: "Runs per implementation per repeat (minimum is kept)"
+        type: string
+        default: "5"
+      repeats:
+        description: "Whole-suite repetitions; their spread decides resolvable"
+        type: string
+        default: "3"
+      full_suite:
+        description: "Use the full dataset grid instead of the small CI set"
+        type: boolean
+        default: false
+      extras:
+        description: "Also run --threads and --crossover (recorded, not concluded from)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  leg:
+    name: ${{ matrix.leg_id }} (${{ matrix.label }}, tier ${{ matrix.tier }})
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Tier A: the comparison set. ubuntu-24.04 appears three times on
+          # purpose -- three draws from the same pool buy microarchitecture
+          # diversity and a variance estimate for the methodology at 1x billing.
+          - { leg_id: lin-x64-a,   label: ubuntu-24.04,     tier: A }
+          - { leg_id: lin-x64-b,   label: ubuntu-24.04,     tier: A }
+          - { leg_id: lin-x64-c,   label: ubuntu-24.04,     tier: A }
+          # Same pool, older glibc: isolates libm from silicon.
+          - { leg_id: lin-x64-old, label: ubuntu-22.04,     tier: A }
+          # aarch64: NEON/SVE instead of AVX, different FMA contraction.
+          - { leg_id: lin-arm64,   label: ubuntu-24.04-arm, tier: A }
+          # MSVC UCRT log instead of glibc, QPC instead of clock_gettime.
+          - { leg_id: win-x64,     label: windows-2025,     tier: A }
+          # Apple libm, P/E core asymmetry. Billed at 10x, so fewer repeats
+          # rather than fewer cases: dropping cases would break per-case
+          # aggregation across boxes.
+          - { leg_id: mac-arm64,   label: macos-15,         tier: A, repeats: "2" }
+          # Tier B: opportunistic, expected to be partial. llvmlite publishes
+          # no win_arm64 wheel, so this leg should land on the NumPy backends.
+          # That it runs at all is the finding.
+          - { leg_id: win-arm64,   label: windows-11-arm,   tier: B }
+    runs-on: ${{ matrix.label }}
+    # A withdrawn label does not error, it waits for a runner until the default
+    # 360-minute timeout. This makes that failure visible in minutes.
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      FASTJSD_CI_LEG: ${{ matrix.leg_id }}
+      FASTJSD_CI_LABEL: ${{ matrix.label }}
+      # Pin the BLAS thread counts: an unset OPENBLAS_NUM_THREADS on a 2-vCPU
+      # box oversubscribes during dataset construction and lands as noise on the
+      # first timed case. OMP_NUM_THREADS is deliberately NOT set -- numba's
+      # OpenMP layer shares it, and pinning it to 1 would silently serialize the
+      # kernel under test.
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fingerprint helper (Linux)
+        if: runner.os == 'Linux'
+        run: echo "FASTJSD_CI_LIBC=$(ldd --version 2>&1 | head -1)" >> "$GITHUB_ENV"
+
+      # Tiered install: "numba is unavailable here" is a supported outcome, not
+      # an error. mpmath is requested at every tier because the accuracy and
+      # exact-zero checks are the outputs that actually travel between boxes.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[bench]' \
+            || pip install -e '.' scipy mpmath psutil \
+            || pip install -e '.' mpmath \
+            || pip install -e '.'
+          pip list
+
+      # Written before anything is timed and uploaded even if timing dies, so a
+      # leg that cannot benchmark still contributes what only it can: what that
+      # box actually is.
+      - name: Machine fingerprint (no timing)
+        run: python bench/portable.py --fingerprint-only | tee "fingerprint-${{ matrix.leg_id }}.json"
+
+      - name: Run the leg
+        run: |
+          python bench/portable.py \
+            --leg-id "${{ matrix.leg_id }}" \
+            --json "portable-${{ matrix.leg_id }}.json" \
+            --reps "${{ inputs.reps }}" \
+            --repeats "${{ matrix.repeats || inputs.repeats }}" \
+            ${{ inputs.full_suite && '--full-suite' || '' }} \
+            ${{ inputs.extras && '--threads --crossover' || '' }} \
+            | tee "portable-${{ matrix.leg_id }}.txt"
+
+      - name: Upload leg
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.leg_id }}
+          path: |
+            portable-${{ matrix.leg_id }}.json
+            portable-${{ matrix.leg_id }}.txt
+            fingerprint-${{ matrix.leg_id }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  aggregate:
+    name: aggregate
+    needs: leg
+    # always(), because the interesting runs are the ones where a leg failed.
+    # A partial matrix is a result, not an error.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download every leg
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          merge-multiple: true
+          path: legs
+
+      - name: What arrived
+        run: ls -la legs || echo "no legs at all"
+
+      # bench/aggregate.py is stdlib-only on purpose: aggregation must not
+      # depend on numpy, scipy or numba resolving, since those are exactly what
+      # can go missing on a thin platform.
+      - name: Aggregate
+        run: |
+          python bench/aggregate.py 'legs/portable-*.json' \
+            --json legs/summary.json | tee legs/summary.txt
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## fastjsd cross-machine"
+            echo
+            echo "Ratios only. Absolute milliseconds from a shared cloud VM are"
+            echo "not comparable across boxes and must not be quoted. See"
+            echo "bench/CROSS_MACHINE.md."
+            echo
+            echo '```'
+            if [ -s legs/summary.txt ]; then
+              cat legs/summary.txt
+            else
+              echo "No leg produced a readable document. Every box either"
+              echo "failed to start, failed to install, or crashed before"
+              echo "writing its JSON. Open the leg jobs."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-summary
+          path: |
+            legs/summary.json
+            legs/summary.txt
+          if-no-files-found: warn
+          retention-days: 90
