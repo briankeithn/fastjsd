@@ -91,6 +91,13 @@ def prepare(
         out = _fused_normalize(P, dst, name, check)
         if out is not None:
             return out
+        # The fallback path must provide the same validation and copy semantics
+        # as the fused path. ``ascontiguousarray`` may have returned the
+        # caller's own array, so do not normalize it in place.
+        if check:
+            _validate(P, name)
+        if copy_if_normalizing:
+            P = P.copy()
 
     sums = P.sum(axis=1)
     if normalize:

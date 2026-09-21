@@ -98,9 +98,10 @@ def test_signature_never_skips_an_overlapping_pair(k):
     would silently drop real intersection terms, so assert directly that the
     bitmap never claims disjoint when the supports actually overlap.
     """
-    from fastjsd._numba import _signatures, available, csr_from_dense
+    from fastjsd._numba import available
     if not available():
         pytest.skip("numba not installed")
+    from fastjsd._numba import _signatures, csr_from_dense
     P = _sparse_rows(40, k, 4, seed=700 + k)
     _, idx, ptr, _ = csr_from_dense(P)
     sig = _signatures(idx, ptr, k)
@@ -122,9 +123,10 @@ def test_signature_width_follows_k(k):
     nothing -- but on wide sparse input those wasted merges are most of the
     kernel's work, so the width is pinned here rather than left to drift.
     """
-    from fastjsd._numba import _SIG_MAX_WORDS, _signatures, available, csr_from_dense
+    from fastjsd._numba import available
     if not available():
         pytest.skip("numba not installed")
+    from fastjsd._numba import _SIG_MAX_WORDS, _signatures, csr_from_dense
     P = _sparse_rows(8, k, min(4, k), seed=k)
     _, idx, ptr, _ = csr_from_dense(P)
     sig = _signatures(idx, ptr, k)
@@ -150,6 +152,8 @@ def test_backends_agree_on_mostly_disjoint_rows(k):
     P = _sparse_rows(40, k, 4, seed=900 + k)
     ref = jsd_matrix(P, backend="numpy")
     for b in ("numpy-sparse", "numba", "numba-sparse"):
+        if b not in available_backends():
+            continue
         got = jsd_matrix(P, backend=b)
         assert np.abs(got - ref).max() < 1e-15, b
 
