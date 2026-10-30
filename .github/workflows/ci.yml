@@ -24,6 +24,16 @@ jobs:
           - os: ubuntu-latest
             python: "3.12"
             extras: "numpy-only"
+          # The declared floors, NumPy 1.24 and Numba 0.58. Nothing else
+          # installs a NumPy 1.x, and 0.1.0 broke on it unnoticed.
+          - os: ubuntu-latest
+            python: "3.11"
+            extras: "oldest"
+          # The SVML kernel, with libsvml from PyPI's intel-cmplr-lib-rt. No
+          # other job can run its tests.
+          - os: ubuntu-latest
+            python: "3.12"
+            extras: "svml"
           # Different libm and code generator: the exact-zero guarantee is a
           # property of one of each until it is checked against another.
           - os: macos-latest
@@ -43,12 +53,37 @@ jobs:
           python -m pip install --upgrade pip
           if [ "${{ matrix.extras }}" = "numpy-only" ]; then
             pip install -e . pytest scipy
+          elif [ "${{ matrix.extras }}" = "oldest" ]; then
+            pip install -e . "numpy==1.24.4" "numba==0.58.1" "scipy==1.10.1" pytest mpmath
+          elif [ "${{ matrix.extras }}" = "svml" ]; then
+            pip install -e ".[test]" intel-cmplr-lib-rt
           else
             pip install -e ".[test]"
           fi
+      # The library must load on every runner. __svml_log8 also needs AVX-512,
+      # which not every runner has: there the SVML tests skip, and this says
+      # so. Any other reason to skip them fails.
+      - name: Check that the SVML kernel is live
+        if: matrix.extras == 'svml'
+        shell: bash
+        run: |
+          python - <<'EOF'
+          from fastjsd import _svml
+          lib, where = _svml._load_library()
+          if lib is None:
+              raise SystemExit("libsvml from intel-cmplr-lib-rt did not load")
+          print("libsvml:", where)
+          why = _svml.why_unavailable()
+          print("numba-svml:", why)
+          if not _svml.available():
+              if "AVX-512" not in why:
+                  raise SystemExit(f"numba-svml should run here: {why}")
+              print("::warning::no AVX-512 on this runner: the numba-svml tests skip")
+          EOF
+      # -rs lists every skipped test with its reason.
       - name: Test
         shell: bash
-        run: pytest -q
+        run: pytest -q -rs
 
   package:
     name: build package
@@ -66,6 +101,16 @@ jobs:
           python -m pip install build twine
           python -m build
           python -m twine check dist/*
+
+      # The sdist's own test suite, against the wheel. The source tree is
+      # removed first, so the tests can import only what was packaged.
+      - name: Test the sdist's suite against the wheel
+        run: |
+          python -m pip install "$(echo dist/*.whl)[test]"
+          mkdir sdist
+          tar -xzf dist/*.tar.gz -C sdist --strip-components=1
+          rm -r sdist/fastjsd
+          cd sdist && pytest -q -rs
 
       - name: Upload built distributions
         uses: actions/upload-artifact@v7
