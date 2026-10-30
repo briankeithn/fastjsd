@@ -297,43 +297,75 @@ not only for identical rows. QED This needs two accumulators: a single
 `hit += a + b` associates differently and leaves `~k eps`, and it needs
 left-to-right summation in `_row_sums_nb`, since `np.sum` reduces in a tree.
 
-**G6 -- disjoint supports give exactly 1.0 in base 2 for SOME inputs, and this
-is not a guarantee.** With an empty intersection the merge contributes nothing
-and the result is `sqrt(0.5 * ln2 * (S_i + S_j) / ln2)`. Whether that lands on
-exactly 1.0 is tested, not proved, and it has **two** independent causes:
-normalized row sums that are not exactly 1.0, and the rounding of the
-one-sided accumulation itself.
+**G6 -- disjoint supports give exactly 1.0 in base 2.** With an empty
+intersection no logarithm is evaluated and nothing reaches the intersection
+sum. Every kernel adds a row's one-sided mass to that row's own total, in
+stored column order -- `onea`/`oneb` in the dense loops, a masked `cumsum`
+per row in the NumPy kernel -- or, in the sparse kernels, recovers it by
+complement from row totals summed in that same order, with nothing to
+subtract. `prepare` snaps each row so that this total is exactly 1.0
+(`_common.snap_row_sums`; the rare row it cannot finish is covered below).
+The one-sided mass is then exactly `2.0`, and
 
-Over 40 random disjoint-support matrices (n=4..20, 1..8 non-zeros per row,
-weights drawn from a Dirichlet rather than uniform), 5460 off-diagonal pairs.
-The second column restricts to the matrices whose normalized row sums are all
-exactly 1.0 -- 1946 of the 5460 pairs -- which rules normalization out:
+        v = 0.5 * (0 + LN2 * 2.0) * inv = LN2 * inv = 1.0
 
-| backend | all pairs | row sums exactly 1.0 |
-|---|---:|---:|
-| `numba-svml` | 27.1 % | 19.0 % |
-| `numba` | 13.6 % | 11.0 % |
-| `numpy` | 12.1 % | 8.3 % |
-| `numba-sparse` | 4.1 % | 0.8 % |
-| `numpy-sparse` | 4.1 % | 0.8 % |
+The first step only scales by powers of two. The second holds for this
+constant, not in general: `inv = 1 / np.log(2.0)` is the reciprocal of the
+same double as `LN2`, and `fl(x * fl(1/x))` is 1.0 for `x = LN2` but not for
+every `x` (`49 * (1/49)` is `1 - eps`). `sqrt(1.0) = 1.0`. QED
 
-Always by 1-2 ULP, and always low. So inexact row sums do contribute -- they
-account for roughly a third of the dense kernels' failures and most of the
-sparse ones -- but the residual is the accumulation of the one-sided terms:
-`SUM_c a_c ln a_c` has to land on exactly `-S_i ln 2` after rounding, and
-whether it does depends on the weights and on the summation order. The sparse
-kernels fail least, and are nearly immune once row sums are exact, because
-their complement recovers `S_i + S_j` directly rather than re-summing the
-coordinates. Uniform weights `1/w` with `w` a power of two happen to work,
-which is why every fixture this package ships hits the exact value --
-`np.eye(n)` is `w=1`, and `bench/accuracy.py`'s disjoint regime uses
-`w = max(1, k//n)`.
+The snap cannot always finish. When a row's last non-zero is below about
+`eps` of the total, the entries before it can already total 1.0 or more, and
+the snap's last stage -- set the last non-zero to `1 - (everything before
+it)` -- has no positive value to give it. The row is then left one step high,
+at `1 + 2 eps`; in a stress test that happened to about 2 % of such rows, and
+never further off. One such row in a pair still sums to exactly `2.0`, since
+`2 + 2 eps` rounds to even. Two give a divergence of `1 + 2 eps`, which the
+square root rounds back to 1.0. So the distance is exactly 1.0 regardless,
+and only `squared=True` can return the `1 + 2 eps`.
 
-So `jsd_matrix(np.eye(4))` does give exactly 1.0, and the property holds on
-every fixture this package ships, but **do not rely on it for arbitrary
-input**. What is safe is `abs(d - 1.0) <= 2 * eps`. G4 (duplicate rows give
-exactly 0.0) is unaffected -- that one is a genuine bitwise cancellation, not
-a rounding coincidence.
+Three side conditions carry the proof, and removing any one of them loses the
+exact value. On 200 random disjoint-support matrices (n = 4..20, 1..8
+non-zeros per row, Dirichlet weights; 31,324 off-diagonal entries), a scalar
+re-implementation of the dense accounting with one condition removed gives:
+
+| condition removed | not exactly 1.0 |
+|---|---:|
+| none | 0 |
+| snapped totals: rows only divided by `P.sum(1)` | 4.3 % |
+| one accumulator per row: one shared by the pair | 14.9 % |
+| one-sided terms kept out of `PL_i + PL_j - 2 m ln m` | 18.0 % |
+
+Dividing by the row sum leaves the total a few ULP off, and `np.sum` reduces
+in a tree, so the snap targets the kernels' left-to-right order and checks
+each stage. A shared accumulator interleaves the two rows' additions, which
+associates differently from either row's own total. And the general summand
+equals `a ln 2` only to within an ULP, because its two logarithms are rounded
+independently.
+
+All three hold in `jsd_matrix` and `jsd_pdist` on every backend, and in
+`jsd_pairwise` and `jsd`, which share the NumPy kernel's arithmetic, in
+float64 with `normalize=True` (the default): none of the 31,324 entries
+misses, and `tests/test_properties.py` pins it with weights that are not
+powers of two. Outside that scope it is not guaranteed. On the same entries:
+
+- `normalize=False` uses the rows as given, so it is exact only if they
+  already total exactly 1.0 left to right; rows divided by `P.sum(1)` first
+  miss on 4.3 %, one step low.
+- `dtype=float32`: the compiled kernels accumulate in float64 and round once,
+  on the way out, and returned exactly 1.0 throughout. The NumPy kernels and
+  `jsd_pairwise` accumulate the row in float32, while the snap -- compiled
+  whenever Numba is installed -- totals it in float64; the two totals then
+  disagree, and 0.8 % come back one float32 step low. Without Numba they
+  agree again.
+
+Before the release, neither the snap nor the per-row accumulators existed:
+4-27 % of disjoint pairs came back 1-2 ULP low, depending on the backend, and
+only power-of-two weights such as `np.eye(n)` were reliably exact. This
+section described that engine until it was corrected after 0.1.0. Until 0.2.0
+`jsd_pairwise` and `jsd` evaluated the general summand on every coordinate and
+summed with `np.sum`: 15 % of disjoint pairs missed, by up to two steps below
+1.0 or one above, and the ones above made `to_similarity` negative.
 
 **G7 -- measured error against 50-digit arithmetic** (`bench/accuracy.py`,
 n=24, k=48, worst over all backends):
@@ -486,6 +518,82 @@ Computing `1 - u^2` accurately means computing `(1-u)(1+u) = 4ab/s^2`, at which
 point the form collapses to `a log1p(u) + b log1p(-u)` -- two logarithms, and a
 cancellation factor of `2/|u|` rather than 3. Better than `1/u^2`, worse than
 the series, and twice the transcendental cost. Not shipped.
+
+
+## The float32 kernel (`numba-f32`)
+
+The other kernels compute in float64 whatever the input dtype. `numba-f32`
+keeps float32 input in float32 through the pair loop, for twice the SIMD
+width, and replaces the libm logarithm with an inlined, division-free
+polynomial so that LLVM can vectorize the whole row -- which it does on
+x86-64 and not on AArch64 (below). That changes which of the arguments above
+carry over.
+
+**In float32 the series is not optional.** The summand `PL_i + PL_j - 2 m ln m`
+is evaluated to an absolute error of a few `u32 |a ln a|` per coordinate
+(`u32 = 2^-24`), while the term itself is `~m u^2`: with the cancellation
+factor `1/u^2` of "The limitation", a float32 evaluation has no correct digits
+left once `u^2` falls below `~u32 |ln m|`. On dense data the pair sums many such
+coordinates. A kernel that uses this summand everywhere and recomputes in
+float64 only the pairs whose float32 `2 JS` is small (the design this kernel
+started from) still errs by up to `3e-6` on the distance just above its
+threshold, where the pair is too far apart for the fallback and too close for
+float32. So the summand switches per coordinate, without a branch once
+if-converted:
+
+| coordinate | form | float32 behaviour |
+|---|---|---|
+| both positive, `\|u\| <= 1/2` | series `m u^2 phi(u^2)`, through `u^18` | no cancellation; `u = 0` gives exactly 0.0 |
+| both positive, `\|u\| > 1/2` | `PL_i + PL_j - (a + b) ln m` | cancellation factor at most `~15 \|ln m\|` |
+| one positive | `a ln 2` | exact identity (Consequence 2) |
+
+The switch sits at `1/2` rather than the float64 kernels' `1/4` because the far
+side's factor is 4x smaller there, and nine series terms already reach float32
+precision at `u^2 = 1/4`. The series needs one division, `u = (a - b)/(a + b)`;
+the polynomial logarithm needs none, which is what pays for it: the whole kernel
+costs ~1.25x the far formula alone.
+
+What holds, and how:
+
+- **G1-G3** are statements about the arithmetic identity and carry over.
+- **G4** holds in the float32 loop itself: identical rows take the series at
+  `u = 0` on every coordinate.
+- **G5** does not apply: this kernel accumulates the one-sided mass directly.
+- **G6** holds through a float64 pass. A disjoint pair's float32 sum of
+  `a ln 2` terms misses `2 ln 2` by rounding, so every pair whose float32 sum
+  lands within a relative `2 (k + 2) u32` of that maximum -- every disjoint
+  pair, and the nearly disjoint ones -- is recomputed from its float32 inputs
+  with the float64 dense summand and one accumulator per row, as in G6's
+  proof. That pass also clamps to the maximum divergence, so the base-2
+  distance never exceeds 1.0.
+- **Accuracy**, against float64 arithmetic on the same float32 rows
+  (`bench/f32.py`), on x86-64: ~1e-7 absolute on the distance, at most 1.6e-7
+  across uniform, Dirichlet(0.1), sparse, 30-decade, band and switch-point
+  regimes with `k` up to 4096; ~1e-7 *relative* on near duplicates, 1.1e-7
+  at worst against 50-digit arithmetic down to distances of 4e-7. SciPy
+  cannot referee that last regime: its grouping cancels as `2/u`, and at
+  `u ~ 5e-7` its float64 result is itself ~1e-4 off.
+- **The pair sum is float32**, so its error grows with `k`. LLVM splits it
+  over its vector lanes, which holds it near 1e-7 for a few thousand
+  coordinates; on Dirichlet(0.1) rows it is 2.0e-7 at `k = 16384`, 8.7e-7 at
+  65536 and 3.4e-6 at 262144.
+
+**On AArch64 the loop is not vectorized.** LLVM vectorizes the pair loop for
+x86-64, but its AArch64 cost model rejects it ("vectorization is not
+beneficial": LLVM 22, through llvmlite 0.48 and Numba 0.66, for each core
+tried -- `generic`, `neoverse-n1`, `neoverse-v2`, `apple-m1`). There the sum
+runs sequentially, which costs both the speed -- 0.7x-1.1x the float64
+kernel on GitHub's Linux aarch64 and Apple Silicon runners -- and accuracy.
+The cross-machine benchmark's ARM legs measured 1.9e-7, 3.2e-7 and 2.5e-7
+on its three dense fixtures, the figures this kernel gives on x86-64 with
+the loop vectorizer off (`NUMBA_LOOP_VECTORIZE=0`, with an empty
+`NUMBA_CACHE_DIR`, or the cache serves the vectorized build). In that order
+`bench/f32.py` measures up to 2.0e-6 absolute over its regimes with `k` up
+to 4096, 1.1e-6 relative on near duplicates, and 8.8e-5 at `k = 262144`. On
+ARM, use `numba`.
+
+Results agree across machines to float32 rounding, not bitwise: the order in
+which LLVM accumulates the float32 lanes follows the host's vector width.
 
 
 ## Implementation notes that are not obvious

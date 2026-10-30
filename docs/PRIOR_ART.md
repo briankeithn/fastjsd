@@ -188,6 +188,16 @@ Surveyed, on the installed versions:
   normalizing, so it computes a **smoothed** divergence: measured deviation
   6.0e-06 on dense rows, 1.2e-04 on 3 %-dense thresholded ones, growing with
   the number of zeros.
+- **NumKong 7.8.6** (formerly SimSIMD) -- dense SIMD kernels behind an
+  all-pairs `cdist`. On one 4-core AVX-512 machine its float32 kernel ran
+  1.3x faster than `numba-f32` on one thread, but `threads=` has no effect
+  for this metric. Its AVX-512 kernels drop every coordinate where either
+  value is below `1e-7` (`1e-15` in float64): disjoint supports return
+  `0.0`, and a single entry below the threshold moved distances by up to
+  6e-3 on dense rows. Its AVX2 and serial kernels keep those coordinates, so
+  the answer depends on the CPU. The older `simsimd` 6.5.16 also
+  approximates `log` and `sqrt` in float32 on its float64 path: 3.6e-2 error
+  on dense rows.
 
 So the gap this package fills is not the identity, it is that nothing in
 Python exploits it. That is also why the Lee-1997 baseline in

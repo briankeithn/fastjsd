@@ -69,6 +69,8 @@ The guarantees, with proofs and the measurements that support them, are in
 - Identical rows return exactly `0.0`, not float dust that `sqrt` amplifies.
   This is a property of keeping the constant inside the sum; forms that fold
   `ln 2` outside it lose the exact zero.
+- Rows with disjoint supports return exactly `1.0` in base 2, for any
+  weights.
 - Results agree with SciPy to within a few times `1e-13` across dense, sparse,
   cross and condensed forms.
 - The individual summand is ill-conditioned when `p` and `q` nearly coincide.
@@ -155,11 +157,12 @@ Every harness also runs on its own:
 | `gpu_baseline.py` | would a GPU make this irrelevant? |
 | `distributions.py` | do the synthetic inputs look like the real ones where it matters? |
 | `fixture_shape.py` | how much of the fixtures' shape does the thresholding step add? |
+| `f32.py` | how accurate is the float32 kernel, and (`--time`) how fast? |
 
-`accuracy.py`, `conditioning.py`, `lee_arrangement.py`, `distributions.py` and
-`fixture_shape.py` start no timer -- they report errors and counts -- so they
-are the ones that are safe to run on a busy machine. The rest are timing
-harnesses and want an idle one.
+`accuracy.py`, `conditioning.py`, `lee_arrangement.py`, `distributions.py`,
+`fixture_shape.py` and `f32.py` without `--time` start no timer -- they report
+errors and counts -- so they are the ones that are safe to run on a busy
+machine. The rest are timing harnesses and want an idle one.
 
 `bench_honest.py` times whatever else is installed alongside the two main
 baselines, so it also needs `pynndescent` and `torch`; `bench/portable.py`,
@@ -195,8 +198,45 @@ with `backend=`:
 - `numpy` and `numpy-sparse`: no compiled dependency.
 - `numba` and `numba-sparse`: parallel dense and intersection kernels.
 - `numba-svml`: an 8-wide vectorised dense kernel when Intel SVML is present.
+- `numba-f32`: an opt-in dense kernel that computes in float32 (below).
 
 `available_backends()` lists what this installation can use.
+
+### The float32 kernel
+
+`backend="numba-f32"` computes in float32 and returns float32 -- it implies
+`dtype=np.float32` -- trading the last digits for throughput. The other
+kernels compute in float64 whatever the input dtype. This one keeps the hot
+loop in float32, which doubles the SIMD width, and replaces the libm logarithm
+with an inlined polynomial, so that LLVM can vectorize the whole row -- which
+it does on x86-64, and does not on ARM. Close coordinates take the
+cancellation-free series of `docs/MATH.md` instead of a logarithm. It is plain
+Numba -- no compiler or runtime library beyond what the `numba` backend
+needs -- so it runs wherever that backend does. `auto` never selects it.
+
+- **Accuracy**, against float64 arithmetic on the same float32 rows: each
+  pair is one float32 sum over its `k` coordinates, so the error grows with
+  `k`. On x86-64, where LLVM splits that sum over its vector lanes, about
+  `1e-7` on the distance -- at most `1.6e-7` over the regimes `bench/f32.py`
+  sweeps, `k` up to 4096 -- rising to `8.7e-7` at `k = 65536` and `3.4e-6`
+  at `k = 262144`, and about `1e-7` *relative* on close pairs. On ARM the sum
+  is sequential: the cross-machine benchmark measured up to `3.2e-7` on its
+  fixtures there (`k <= 64`), and `bench/f32.py` run in that order reaches
+  `2e-6` over its regimes with `k` up to 4096 and `9e-5` at `k = 262144`
+  (`docs/MATH.md`). The float64 kernels fed float32 input can be `1e-4` off
+  on near duplicates, because they round `a + b` to float32 first.
+- **Exactness**: identical rows give exactly `0.0` and disjoint supports
+  exactly `1.0` in base 2, as on the other backends; the base-2 distance never
+  exceeds `1.0`. Results agree across machines to float32 rounding, not
+  bitwise.
+- **Speed**, one machine (4-core Xeon at 2.8 GHz, AVX-512, float32 input for
+  every kernel, `python bench/f32.py --time`): 2.3x-2.5x faster than
+  `numba-svml` and 5.6x-7.5x faster than `numba` on dense matrices of 192 to
+  1024 rows, single-threaded and on 4 threads. On GitHub's runners the
+  cross-machine workflow measured it 2.1x-6.4x faster than `numba` on x86-64,
+  but 0.7x-1.1x on ARM (Linux aarch64 and Apple Silicon), where LLVM leaves
+  its loop scalar: there it is no faster and less accurate, so use `numba`.
+  Measure your own.
 
 ## API
 

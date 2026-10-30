@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastjsd"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast exact pairwise Jensen-Shannon distance matrices"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Brian Keith-Norambuena" }]
 keywords = [
@@ -20,7 +21,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -32,7 +32,7 @@ dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
 numba = ["numba>=0.58"]
-test = ["pytest", "scipy", "numba>=0.58"]
+test = ["pytest", "scipy", "numba>=0.58", "mpmath"]
 bench = ["pytest", "scipy", "numba>=0.58", "mpmath", "psutil"]
 
 [project.urls]

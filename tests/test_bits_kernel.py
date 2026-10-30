@@ -124,15 +124,18 @@ def test_duplicate_rows_are_exactly_zero_in_both():
             assert ob[a, b] == 0.0
 
 
-def test_disjoint_supports_agree_and_do_not_exceed_one():
-    """G6 is not a guarantee for arbitrary weights, so pin agreement and the
-    bound rather than the exact 1.0 -- see `docs/MATH.md`."""
+def test_disjoint_supports_agree_and_are_exactly_one():
+    """G6 on both kernels, and the same bits from each.
+
+    `_both` skips `prepare`, so these rows are not snapped; four entries of
+    0.25 already total exactly 1.0, which is the precondition the snap would
+    otherwise establish -- see `docs/MATH.md` G6."""
     P = np.zeros((12, 48))
     for i in range(12):
         P[i, i * 4:(i + 1) * 4] = 0.25
     om, ob = _both(P)
     assert np.array_equal(om, ob)
-    assert om.max() <= 1.0 + 2 * np.finfo(np.float64).eps
+    assert np.all(om[~np.eye(12, dtype=bool).reshape(-1)] == 1.0)
 
 
 def test_cross_kernels_are_bitwise_identical():
@@ -271,3 +274,24 @@ def test_agrees_with_the_dense_kernel_on_dense_input():
     assert np.array_equal(om, ob)
     ref = jsd_matrix(P, backend="numpy")
     assert np.abs(ob.reshape(24, 24) - ref).max() < 5e-13
+
+
+def test_bitcount_fallback_matches_numpy():
+    """`_bitcount_by_bytes` stands in for `np.bitwise_count` on NumPy < 2.0.
+
+    Checked against Python's own bit count, so it means the same on either
+    NumPy, and against `np.bitwise_count` wherever that exists.
+    """
+    rng = np.random.default_rng(18)
+    x = rng.integers(0, 2**63, (40, 9), dtype=np.uint64)
+    x[:, 0] |= np.uint64(1) << np.uint64(63)
+    x[0] = 0
+    x[1] = np.iinfo(np.uint64).max
+    for v in (x, x[:, ::2]):  # contiguous, and a strided view
+        got = nb._bitcount_by_bytes(v)
+        ref = np.array([[bin(int(e)).count("1") for e in row] for row in v],
+                       dtype=np.uint8)
+        assert got.dtype == np.uint8
+        assert np.array_equal(got, ref)
+        if hasattr(np, "bitwise_count"):
+            assert np.array_equal(got, np.bitwise_count(v))

@@ -135,7 +135,13 @@ Read the output in the order it prints, which is not the order you want:
 4. The per-configuration sections. `numba` and `numpy-only` are partitioned
    **before** anything is combined, and only the `numba` section belongs to the
    headline.
-5. The consistency verdict, then the caveats, reprinted with the numbers rather
+5. **`numba-f32 vs numba`** -- the float32 kernel against the float64 one, on
+   the same float32 rows, on every case `auto` sends to a dense kernel. A claim
+   of its own, so a section of its own, under the same rules: counted over
+   boxes, geometric mean per box, and any loss printed with the `LOSSES` at the
+   top. Below the table, numba-f32's accuracy against 50-digit truth of its
+   float32-rounded input, worst over boxes.
+6. The consistency verdict, then the caveats, reprinted with the numbers rather
    than linked from them.
 
 Three properties of the arithmetic, because they are the reason to trust it:
@@ -188,6 +194,8 @@ never a replacement for a single-machine measurement made with
 | **A range, never a point** | "the ratio range across boxes and cases is `<min>`x-`<max>`x (median per-box geomean `<gm>`x)" -- the aggregator prints all three; quote them together or not at all. |
 | **Accuracy against 50-digit mpmath truth** | Deterministic. Noise cannot touch it. None of the caveats apply. |
 | **Duplicate rows returning exactly 0.0** | Deterministic, and the highest-value output here: the guarantee depends on `PL[i,c] + PL[j,c]` cancelling `2 m log m` bitwise, which is a property of one libm and one code generator until it is checked against another. A failure on any box is a real portability defect in the guarantee, not a measurement artifact. |
+| **Disjoint supports returning exactly 1.0** | The other end of the scale (`docs/MATH.md` G6), as deterministic, checked on every fastjsd entry including numba-f32. A failure is a portability defect, as above. |
+| **numba-f32 vs numba, counted over boxes** | "numba-f32 was faster than numba on `<w>`/`<B>` boxes and `<c>`/`<N>` case-box pairs; ratio range `<min>`x-`<max>`x." Both kernels run in the same harness, with the same thread count, on the same float32 rows, so clock rate and core count divide out, as they do for Lee-1997. What varies is whether the box vectorizes the float32 loop, which is the point. |
 | **Degradation behaviour** | "on a runner with no numba wheel the package falls back to the NumPy backends and reports it" is a fact about the software, not about the hardware. |
 
 ### Not quotable
@@ -198,7 +206,7 @@ never a replacement for a single-machine measurement made with
 | **"The" speedup over SciPy** | SciPy's pdist is single-threaded and fastjsd is parallel, so this ratio scales with usable core count -- 2 vCPU on a standard private-repo runner, more elsewhere -- and is biased upward on a noisy box by min-of-N. A CI SciPy ratio quoted as the speedup is the single most likely way this goes wrong. |
 | **Thread scaling** | 2-4 vCPUs that may be SMT siblings on a shared host is not a scaling study; a noisy neighbour is indistinguishable from sublinear scaling. The defensible statement is only "monotone and > 1". Thread scaling should stay a single-machine measurement, stated as such. |
 | **A crossover location** | Near the crossover the kernels are by definition within noise. Report the **regret** from using the shipped `SPARSE_DENSITY_MAX` against each box's own optimum, which is portable; the location is not. |
-| **Anything about `numba-svml`** | libsvml is not on PyPI and no ARM or Apple host can run it. Every CI figure is the libm path. |
+| **Anything about `numba-svml`** | The legs do not install libsvml (PyPI's `intel-cmplr-lib-rt`), and no ARM or Apple host can run it. Every cross-machine figure is the libm path. |
 | **A pooled number across configurations** | Legs without numba measure the support-intersection identity rather than the kernel, and on dense inputs can be *slower* than SciPy. That is a real finding, and pooling it into a headline range destroys both claims. Keep the section separate and give it its own sentence. |
 | **Any claim about hardware GitHub does not rent** | N runners is not a random sample of computing hardware. Nothing here supports a claim about GPUs, other clouds, bare metal, or CPUs outside the set. |
 | **A CPU identified by its runner label** | `ubuntu-latest` is not one machine. The recorded `machine.cpu_model` is the fact; the label is not. That is why the workflow draws `ubuntu-24.04` three times. |

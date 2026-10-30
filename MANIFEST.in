@@ -1,0 +1,5 @@
+# The sdist ships a test suite that runs: tests/conftest.py, which the test
+# modules import, and bench/, which tests/test_crossmachine.py imports.
+include tests/conftest.py
+recursive-include bench *.py *.md
+include bench/fixtures/*.npy
