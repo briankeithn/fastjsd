@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from . import _numba, _numpy, _svml
-from ._common import check_base, density, prepare, xlogx
+from . import _f32, _numba, _numpy, _svml
+from ._common import LN2, check_base, density, prepare, xlogx
 
 __all__ = [
     "jsd", "jsd_matrix", "jsd_pdist", "jsd_pairwise", "to_similarity",
@@ -55,7 +55,7 @@ SPARSE_DENSITY_MAX = 0.60
 SVML_DENSITY_MAX = 0.30
 
 _BACKENDS = ("auto", "numpy", "numpy-sparse", "numba", "numba-sparse",
-             "numba-svml")
+             "numba-svml", "numba-f32")
 
 
 def available_backends() -> tuple[str, ...]:
@@ -63,10 +63,14 @@ def available_backends() -> tuple[str, ...]:
 
     ``numba-svml`` appears only when Intel's ``libsvml`` is loadable *and* the
     host has AVX-512; ``_svml.why_unavailable()`` says which is missing.
+    ``numba-f32``, which computes in float32 and which ``auto`` never picks,
+    comes last.
     """
     if _numba.available():
         base = ("numba-sparse", "numba", "numpy-sparse", "numpy")
-        return ("numba-svml",) + base if _svml.available() else base
+        if _svml.available():
+            base = ("numba-svml",) + base
+        return base + ("numba-f32",)
     return ("numpy-sparse", "numpy")
 
 
@@ -117,7 +121,18 @@ def _resolve_well_conditioned(flag, kernel):
 
     ``None`` never raises -- a default that failed on a backend the caller
     picked deliberately would cost more than the accuracy it buys.
+
+    ``numba-f32`` has no switch: in float32 the cancellation-free series is
+    what keeps close coordinates accurate at all, so it is always on.
     """
+    if kernel == "numba-f32":
+        if flag is False:
+            raise ValueError(
+                "backend='numba-f32' always uses the cancellation-free series "
+                "on close coordinates; well_conditioned=False is not "
+                "available there. Leave well_conditioned unset."
+            )
+        return True
     if flag is None:
         return kernel == "numba-sparse"
     if flag and kernel not in _WC_KERNELS:
@@ -142,6 +157,18 @@ def _drop_empty_columns(P, Q):
     if Q is not None:
         Q = np.ascontiguousarray(Q[:, keep])
     return P, Q
+
+
+def _working_dtype(backend, dtype):
+    """``numba-f32`` computes in float32, so it fixes the working dtype."""
+    if backend != "numba-f32":
+        return dtype
+    if dtype is not None and np.dtype(dtype) != np.float32:
+        raise ValueError(
+            f"backend='numba-f32' computes in float32, got dtype="
+            f"{np.dtype(dtype)}. Leave dtype unset or pass np.float32."
+        )
+    return np.float32
 
 
 def _prep_pair(P, Q, dtype, normalize, check):
@@ -200,14 +227,19 @@ def jsd_matrix(
         Working and output dtype. ``float32`` roughly halves memory and time
         for a worst-case error near ``1e-4`` on the distance; ``float64``
         (the default for integer or float64 input) agrees with SciPy to
-        ~1e-13.
+        ~1e-13. ``backend="numba-f32"`` implies ``float32``.
     backend : str, default "auto"
         One of ``"auto"``, ``"numpy"``, ``"numpy-sparse"``, ``"numba"``,
-        ``"numba-sparse"``, ``"numba-svml"``. ``auto`` picks the sparse
-        Numba kernel below the applicable nonzero fraction
+        ``"numba-sparse"``, ``"numba-svml"``, ``"numba-f32"``. ``auto`` picks
+        the sparse Numba kernel below the applicable nonzero fraction
         (``SVML_DENSITY_MAX`` where the SVML kernel is available,
         ``SPARSE_DENSITY_MAX`` otherwise), the matching dense kernel above
-        it, and the NumPy kernels when Numba is absent.
+        it, and the NumPy kernels when Numba is absent. ``numba-f32`` is
+        opt-in: a dense kernel that computes in float32, with exact 0.0 and
+        1.0 where the others are exact. On x86-64 it is several times faster
+        than the other dense kernels for an error near ``1e-7`` on the
+        distance; on ARM, where LLVM leaves its loop scalar, it is no faster
+        and less accurate.
     out : ndarray, optional
         Preallocated output of the right shape and dtype, C-contiguous.
     threads : int, optional
@@ -233,7 +265,7 @@ def jsd_matrix(
            [0.557923, 0.557923, 0.      ]])
     """
     inv = 1.0 / np.log(check_base(base))
-    P, Q = _prep_pair(P, Q, dtype, normalize, check)
+    P, Q = _prep_pair(P, Q, _working_dtype(backend, dtype), normalize, check)
     n, m = P.shape[0], (P.shape[0] if Q is None else Q.shape[0])
     if out is not None:
         _check_out(out, (n, m), P.dtype)
@@ -252,6 +284,8 @@ def jsd_matrix(
             return _numba.matrix(P, Q, inv, squared, out, wc)
         if kernel == "numba-svml":
             return _svml.matrix(P, Q, inv, squared, out)
+        if kernel == "numba-f32":
+            return _f32.matrix(P, Q, inv, squared, out)
         return _numba.matrix_sparse(P, Q, inv, squared, out, wc)
 
 
@@ -280,7 +314,8 @@ def jsd_pdist(
     kernel here.
     """
     inv = 1.0 / np.log(check_base(base))
-    P = prepare(P, name="P", dtype=dtype, normalize=normalize, check=check)
+    P = prepare(P, name="P", dtype=_working_dtype(backend, dtype),
+                normalize=normalize, check=check)
     n = P.shape[0]
     size = n * (n - 1) // 2
     if out is not None:
@@ -298,6 +333,8 @@ def jsd_pdist(
             return _numba.pdist(P, inv, squared, out, wc)
         if kernel == "numba-svml":
             return _svml.pdist(P, inv, squared, out)
+        if kernel == "numba-f32":
+            return _f32.pdist(P, inv, squared, out)
         return _numba.pdist_sparse(P, inv, squared, out, wc)
 
 
@@ -315,6 +352,13 @@ def jsd_pairwise(
 
     ``P`` and ``Q`` broadcast against each other on the row axis, so a
     single distribution can be compared against a whole stack.
+
+    The arithmetic is the NumPy kernel's (``_numpy._block``): the general
+    summand on matched coordinates only, ``PL + QL`` grouped before the
+    mixture term, and ``ln 2`` times each row's one-sided mass, totalled left
+    to right. That is what makes disjoint supports exactly 1.0 and identical
+    rows exactly 0.0 here as in ``jsd_matrix`` (``docs/MATH.md`` G4, G6), and
+    ``jsd(p, q)`` bitwise equal to ``jsd(q, p)``.
     """
     inv = 1.0 / np.log(check_base(base))
     P, Q = _prep_pair(P, Q, dtype, normalize, check)
@@ -328,15 +372,21 @@ def jsd_pairwise(
                 f"P and Q must have the same number of rows or one must have "
                 f"a single row, got {P.shape[0]} and {Q.shape[0]}"
             )
+    bp = P > 0.0
+    bq = Q > 0.0
+    both = bp & bq
     M = 0.5 * (P + Q)
-    nz = M > 0
     L = np.zeros_like(M)
-    np.log(M, out=L, where=nz)
+    np.log(M, out=L, where=both)
     L *= M
     L *= -2.0
-    L += xlogx(P)
-    L += xlogx(Q)
+    L += xlogx(P) + xlogx(Q)
+    L *= both
     D = L.sum(axis=1)
+    zero = P.dtype.type(0.0)
+    one = np.cumsum(np.where(bq, zero, P), axis=1)[:, -1]
+    one += np.cumsum(np.where(bp, zero, Q), axis=1)[:, -1]
+    D += LN2 * one
     D *= 0.5 * inv
     np.clip(D, 0.0, None, out=D)
     return D if squared else np.sqrt(D, out=D)

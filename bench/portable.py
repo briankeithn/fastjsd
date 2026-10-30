@@ -41,10 +41,18 @@ Recording its own reliability.
     "indistinguishable" rather than a number.
 
 Statistics-only checks (accuracy against 50-digit truth, the exactly-zero
-guarantee on duplicate rows) are deterministic and DO travel across boxes.
-They are the highest-value output here, because the exact-zero property depends
-on ``PL[i,c] + PL[j,c]`` cancelling ``2 m log m`` bitwise, which is a property
-of one libm and one code generator until it is checked against another.
+guarantee on duplicate rows, exactly 1.0 on disjoint supports) are
+deterministic and DO travel across boxes. They are the highest-value output
+here, because the exact-zero property depends on ``PL[i,c] + PL[j,c]``
+cancelling ``2 m log m`` bitwise, which is a property of one libm and one code
+generator until it is checked against another.
+
+``numba-f32`` is timed in its own section, against the float64 dense kernel on
+the same float32 rows. ``auto`` never selects it, so it has no place in the
+``fastjsd auto`` comparison, and its claim is a different one: that a float32
+pair loop LLVM vectorizes beats the float64 loop on this CPU. Vectorization is
+exactly the part that depends on the hardware, which makes that ratio a
+direction claim of the kind this harness exists for.
 """
 
 from __future__ import annotations
@@ -65,11 +73,14 @@ import numpy as np
 
 import fastjsd
 from fastjsd import available_backends, jsd_matrix, resolve_backend
+from fastjsd._common import prepare
 
 import baselines
 import datasets
 
-SCHEMA = "fastjsd-crossmachine/1"
+#: /2 added the ``f32`` section, ``fastjsd numba-f32`` in the exact-zero check,
+#: and the disjoint-supports check under ``accuracy``.
+SCHEMA = "fastjsd-crossmachine/2"
 
 #: Validity thresholds, published here so the aggregator's rule stays
 #: mechanical: drop unusable, warn on suspect.
@@ -90,6 +101,22 @@ _PROBE = np.array([[0.5, 0.3, 0.2],
                    [0.1, 0.1, 0.8],
                    [0.4, 0.4, 0.2],
                    [0.2, 0.5, 0.3]])
+
+#: The ``f32`` section: ``F32_SUBJECT`` timed against ``F32_BASELINE``, and the
+#: ratio is baseline / subject, so above 1.0 the float32 kernel is faster.
+F32_SUBJECT = "numba-f32"
+F32_BASELINE = "numba"
+#: Agreement bound for numba-f32 against the float64 kernel on the same float32
+#: rows, the tolerance `tests/test_f32.py` asserts. It tells a working kernel
+#: from a broken one; the error itself is recorded beside it, up to 1.9e-7 on
+#: x86-64 and 3.2e-7 on ARM, where LLVM leaves the float32 sum scalar.
+F32_TOL = 1e-6
+#: How `bench/f32.py --time` calls both kernels: rows prepared once, as float32.
+F32_KW = {"normalize": False, "check": False}
+#: Decimals kept on a timed `ms`: the nanosecond. `aggregate.crosscheck` holds
+#: the ratio of two minima to its ratio block within 1e-3, so the rounding has
+#: to stay far below that even for a case timed in microseconds.
+MS_DIGITS = 6
 
 CAVEATS = (
     "These figures were measured on shared, oversubscribed cloud VMs. They "
@@ -129,8 +156,15 @@ CAVEATS = (
     "regret against each box's own optimum -- not that the crossover sits at "
     "0.60 everywhere.",
 
-    "The numba-svml backend cannot appear in CI: libsvml is not on PyPI and no "
-    "ARM or Apple host can run it. Every figure here is the libm path.",
+    "The numba-svml backend does not appear here: the legs do not install "
+    "libsvml (PyPI's intel-cmplr-lib-rt), and no ARM or Apple host can run it. "
+    "Every figure here is the libm path.",
+
+    "numba-f32 is timed against the float64 dense kernel on the same float32 "
+    "rows, as `bench/f32.py --time` does, on the cases `auto` sends to a dense "
+    "kernel. That ratio says whether this CPU runs the float32 loop faster. It "
+    "says nothing about numba-svml, which no leg installs, so the README's "
+    "numba-svml comparison stays a one-machine figure.",
 
     "Legs without numba report the NumPy backends only. Those measure a "
     "different claim -- the support-intersection identity, not the kernel -- "
@@ -723,6 +757,27 @@ def probe():
     return runnable, absent
 
 
+def _f32_matrix(P):
+    return jsd_matrix(P, backend=F32_SUBJECT)
+
+
+def probe_f32():
+    """``(fn, None)`` if numba-f32 runs on this box, else ``(None, reason)``.
+
+    Separate from `probe` because numba-f32 is not one of the implementations
+    timed against the baselines. Probed all the same, so that a kernel which
+    does not compile here is recorded as absent instead of raising inside the
+    timing or the exactness checks and taking the whole leg down with it.
+    """
+    if F32_SUBJECT not in available_backends():
+        return None, "numba-f32 needs numba, which is not installed here"
+    try:
+        _f32_matrix(_PROBE)              # also pays its JIT, once
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    return _f32_matrix, None
+
+
 # ---------------------------------------------------------------------------
 # timing
 # ---------------------------------------------------------------------------
@@ -804,7 +859,7 @@ def bench_case(label, P, runnable, absent, args, ref_name):
         per_repeat.append(interleaved(fns, Pc, args.reps))
 
     for idx, nm in enumerate(names):
-        ms = [round(rep[idx] * 1e3, 4) for rep in per_repeat]
+        ms = [round(rep[idx] * 1e3, MS_DIGITS) for rep in per_repeat]
         row["impls"][nm] = {
             "status": "ok", "ms": ms,
             "ms_min": min(ms), "ms_median": float(np.median(ms)),
@@ -834,6 +889,76 @@ def bench_case(label, P, runnable, absent, args, ref_name):
                 "fastjsd_wins": bool(float(np.median(rs)) > 1.0),
             }
     return row
+
+
+def f32_case(label, P, args):
+    """numba-f32 against the float64 dense kernel, both on the same float32 rows.
+
+    The rows are prepared once and both kernels are called the way
+    `bench/f32.py --time` calls them, so this is the published ratio measured
+    on this box. Verified first, against the float64 kernel's well-conditioned
+    path on those rows -- what the float32 kernel's documented accuracy is
+    stated against. A failure is recorded on the case, not raised: one kernel
+    that will not run here must not cost the leg its other results.
+    """
+    n, k = P.shape
+    row = {"case": label, "n": int(n), "k": int(k), "status": "ok",
+           "impls": {}, "ratio": None, "max_abs_err": None, "agrees": None,
+           "tol": F32_TOL}
+
+    def baseline(X):
+        return jsd_matrix(X, backend=F32_BASELINE, **F32_KW)
+
+    def subject(X):
+        return jsd_matrix(X, backend=F32_SUBJECT, **F32_KW)
+
+    try:
+        P32 = prepare(P, dtype=np.float32)
+        ref = jsd_matrix(P32.astype(np.float64), backend=F32_BASELINE,
+                         well_conditioned=True, **F32_KW)
+        err = float(np.abs(np.asarray(subject(P32), dtype=np.float64)
+                           - ref).max())
+        baseline(P32)                    # the float32-input specialization's JIT
+        per_repeat = [interleaved([baseline, subject], P32, args.reps)
+                      for _ in range(args.repeats)]
+    except Exception as exc:
+        row["status"] = "failed"
+        row["reason"] = f"{type(exc).__name__}: {exc}"
+        return row
+
+    row["max_abs_err"] = err
+    row["agrees"] = bool(err <= F32_TOL)
+    for idx, nm in enumerate((F32_BASELINE, F32_SUBJECT)):
+        ms = [round(rep[idx] * 1e3, MS_DIGITS) for rep in per_repeat]
+        row["impls"][nm] = {"ms": ms, "ms_min": min(ms),
+                            "ms_median": float(np.median(ms))}
+    rs = [rep[0] / rep[1] for rep in per_repeat]
+    row["ratio"] = {
+        "per_repeat": [round(r, 4) for r in rs],
+        "min": min(rs), "median": float(np.median(rs)), "max": max(rs),
+        "resolvable": bool(min(rs) > 1.0 or max(rs) < 1.0),
+        "f32_wins": bool(float(np.median(rs)) > 1.0),
+    }
+    return row
+
+
+def f32_section(cases, args, f32_fn, f32_absent):
+    """numba-f32 on every case that `auto` sends to a dense kernel.
+
+    The sparse cases are left out because the comparison there would be with
+    the sparse kernel, which is a different claim, and not the one 0.2.0 makes.
+    """
+    out = {"subject": F32_SUBJECT, "baseline": F32_BASELINE,
+           "ratio": f"{F32_BASELINE} / {F32_SUBJECT}",
+           "input": "float32 rows prepared once; normalize=False, check=False",
+           "tol": F32_TOL}
+    if f32_fn is None:
+        return {**out, "status": "absent", "reason": f32_absent, "cases": []}
+    dense = [(label, P) for label, P in cases
+             if resolve_backend("auto", np.ascontiguousarray(P, dtype=np.float64))
+             in ("numba", "numba-svml")]
+    return {**out, "status": "ok",
+            "cases": [f32_case(label, P, args) for label, P in dense]}
 
 
 def threads_scan(P, args):
@@ -943,7 +1068,40 @@ def exactness(runnable):
             "worst_nonzero": {nm: v["max"] for nm, v in out.items()}}
 
 
-def accuracy_vs_mpmath(n=16, k=24):
+def disjoint_exactness(runnable):
+    """Disjoint supports must come back exactly 1.0 in base 2. Not approximately.
+
+    The other end of the scale from the zero check, and as deterministic
+    (`docs/MATH.md` G6). Only fastjsd's entries are held to it: SciPy works in
+    base e, where the distance has no exact value to hit, and the published
+    form makes no such promise. The weights are Dirichlet draws, not powers of
+    two, because powers of two make every one-sided total exact by luck and
+    would pass on an engine that never snaps a row total.
+    """
+    fns = {nm: fn for nm, fn in runnable if nm.startswith("fastjsd")}
+    misses = dict.fromkeys(fns, 0)
+    worst = dict.fromkeys(fns, 0.0)
+    trials, n = 0, 4
+    off = ~np.eye(n, dtype=bool)
+    for w in (2, 4, 8, 16, 32):
+        for seed in range(8):
+            P = np.zeros((n, n * w))
+            for r in range(n):
+                P[r, r * w:(r + 1) * w] = datasets.dirichlet(
+                    1, w, 0.3, seed=100 * seed + r)[0]
+            trials += 1
+            for name, fn in fns.items():
+                miss = float(np.abs(np.asarray(fn(P), dtype=np.float64)[off]
+                                    - 1.0).max())
+                if miss != 0.0:
+                    misses[name] += 1
+                    worst[name] = max(worst[name], miss)
+    return {"trials": trials,
+            "exact_one": {nm: misses[nm] == 0 for nm in fns},
+            "worst_miss": worst}
+
+
+def accuracy_vs_mpmath(n=16, k=24, f32_ok=True):
     """Error against 50-digit truth, per regime, per available backend.
 
     Deterministic, so it is directly comparable across boxes -- unlike every
@@ -954,6 +1112,11 @@ def accuracy_vs_mpmath(n=16, k=24):
     true distances there are ~1e-9, so a 1e-8 absolute error is a relative
     error of tens. That is the ill-conditioned band the package documents, not
     a defect, and a single field named "error" invites reading it as one.
+
+    numba-f32 is measured against the truth of the float32 rows it actually
+    receives. Rows closer than float32 can resolve round to the SAME row, whose
+    exact distance is 0.0, so against the float64 input the near-duplicate
+    regime would report that rounding as a 100 % error of the kernel.
     """
     try:
         import accuracy as acc
@@ -965,6 +1128,15 @@ def accuracy_vs_mpmath(n=16, k=24):
         ref = acc.exact_matrix(P)
         per_backend = {}
         for b in available_backends():
+            if b == F32_SUBJECT:
+                if not f32_ok:
+                    continue
+                P32 = prepare(P, dtype=np.float32).astype(np.float64)
+                abs_err, rel_err = acc.errors(P32, acc.exact_matrix(P32),
+                                              jsd_matrix(P, backend=b))
+                per_backend[b] = {"abs": float(abs_err), "rel": float(rel_err),
+                                  "reference": "its float32-rounded input"}
+                continue
             abs_err, rel_err = acc.errors(P, ref, jsd_matrix(P, backend=b))
             per_backend[b] = {"abs": float(abs_err), "rel": float(rel_err)}
         out["per_regime"][name] = per_backend
@@ -1041,6 +1213,41 @@ def validity(cases, steal, load_before, load_after, nivcsw_delta, wall):
 # output
 # ---------------------------------------------------------------------------
 
+def print_f32(f32):
+    title = (f"{F32_SUBJECT} against {F32_BASELINE}, dense cases, float32 input "
+             f"for both (ratio = {F32_BASELINE} / {F32_SUBJECT}):")
+    print("\n" + title)
+    if f32["status"] != "ok":
+        print(f"  absent: {f32['reason']}")
+        return
+    if not f32["cases"]:
+        print("  no case in this set goes to a dense kernel")
+        return
+    print(f"  {'case':34}{F32_BASELINE:>11}{F32_SUBJECT:>11}{'ratio':>9}"
+          f"{'max err':>10}")
+    for row in f32["cases"]:
+        if row["status"] != "ok":
+            print(f"  {row['case']:34}failed: {row['reason']}")
+            continue
+        r = row["ratio"]
+        cell = f"{r['median']:.2f}x" if r["resolvable"] else "~"
+        print(f"  {row['case']:34}"
+              f"{row['impls'][F32_BASELINE]['ms_min']:>11,.1f}"
+              f"{row['impls'][F32_SUBJECT]['ms_min']:>11,.1f}"
+              f"{cell:>9}{row['max_abs_err']:>10.1e}")
+    bad = [row for row in f32["cases"]
+           if row["status"] == "ok" and not row["agrees"]]
+    for row in bad:
+        print(f"*** DISAGREEMENT: {F32_SUBJECT} on {row['case']} is "
+              f"{row['max_abs_err']:.2e} from the float64 kernel, above "
+              f"{row['tol']:.0e}. Its timing measures something else.")
+    slow = [row for row in f32["cases"]
+            if row["status"] == "ok" and row["ratio"]["median"] < 1.0]
+    for row in slow:
+        print(f"*** {F32_SUBJECT} was SLOWER than {F32_BASELINE} on "
+              f"{row['case']}: {row['ratio']['median']:.2f}x")
+
+
 def print_table(doc):
     names = []
     for row in doc["cases"]:
@@ -1105,6 +1312,8 @@ def print_table(doc):
         print("reference and no SciPy baseline; agreement was checked against")
         print("fastjsd's own NumPy backend, which is not a check.")
 
+    print_f32(doc["f32"])
+
     ex = doc["accuracy"]["duplicate_rows_exact_zero"]
     print("\nidentical rows, exactly 0.0 "
           f"({doc['accuracy']['trials']} draws, deterministic -- this DOES "
@@ -1113,6 +1322,24 @@ def print_table(doc):
         worst = doc["accuracy"]["worst_nonzero"][nm]
         print(f"  {nm:24} " + ("exact 0.0 in all" if ok
                                else f"NONZERO, max {worst:.2e}"))
+
+    one = doc["accuracy"]["disjoint_supports_exact_one"]
+    print("\ndisjoint supports, exactly 1.0 in base 2 "
+          f"({doc['accuracy']['disjoint_trials']} draws, deterministic):")
+    for nm, ok in one.items():
+        worst = doc["accuracy"]["disjoint_worst_miss"][nm]
+        print(f"  {nm:24} " + ("exact 1.0 in all" if ok
+                               else f"MISSED, worst |d - 1| {worst:.2e}"))
+
+    vs = doc["accuracy"]["vs_mpmath"]
+    per = {reg: be.get(F32_SUBJECT)
+           for reg, be in vs.get("per_regime", {}).items()}
+    if any(per.values()):
+        print(f"\n{F32_SUBJECT} against 50-digit truth of its float32-rounded "
+              "input (deterministic):")
+        for reg, e in per.items():
+            if e:
+                print(f"  {reg:24} abs {e['abs']:.1e}   rel {e['rel']:.1e}")
 
     v = doc["validity"]
     print(f"\nvalidity: {v['verdict']}   steal={v['steal_frac']}   "
@@ -1162,6 +1389,7 @@ def main():
     # Probe first: it pays every JIT, and it is what makes
     # `numba.threading_layer()` answerable instead of raising.
     runnable, absent = probe()
+    f32_fn, f32_absent = probe_f32()
     doc = {"schema": SCHEMA, "leg_id": args.leg_id,
            "produced_at_utc": datetime.now(timezone.utc).isoformat(),
            "machine": machine(args.leg_id), "software": software()}
@@ -1171,7 +1399,9 @@ def main():
                           "machine": doc["machine"],
                           "software": doc["software"],
                           "runnable": [n for n, _ in runnable],
-                          "absent": absent}, indent=2, default=str))
+                          "absent": absent,
+                          F32_SUBJECT: f32_absent or "runs"},
+                         indent=2, default=str))
         return
 
     ref_name = ("scipy pdist" if any(n == "scipy pdist" for n, _ in runnable)
@@ -1185,6 +1415,7 @@ def main():
     doc["absent"] = absent
     doc["cases"] = [bench_case(label, P, runnable, absent, args, ref_name)
                     for label, P in cases]
+    doc["f32"] = f32_section(cases, args, f32_fn, f32_absent)
 
     doc["threads"] = threads_scan(cases[0][1], args) if args.threads else []
     if args.crossover:
@@ -1192,11 +1423,18 @@ def main():
     else:
         doc["crossover"], doc["crossover_summary"] = [], None
 
-    acc = accuracy_vs_mpmath()
-    zero = exactness(runnable)
+    acc = accuracy_vs_mpmath(f32_ok=f32_fn is not None)
+    exact_fns = list(runnable)
+    if f32_fn is not None:
+        exact_fns.append((f"fastjsd {F32_SUBJECT}", f32_fn))
+    zero = exactness(exact_fns)
+    one = disjoint_exactness(exact_fns)
     doc["accuracy"] = {"trials": zero["trials"],
                        "duplicate_rows_exact_zero": zero["exact_zero"],
                        "worst_nonzero": zero["worst_nonzero"],
+                       "disjoint_trials": one["trials"],
+                       "disjoint_supports_exact_one": one["exact_one"],
+                       "disjoint_worst_miss": one["worst_miss"],
                        "vs_mpmath": acc}
 
     steal_after = None

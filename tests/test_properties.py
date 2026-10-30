@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 from conftest import dirichlet, thresholded
 
-from fastjsd import available_backends, jsd_matrix, jsd_pdist, to_similarity
+from fastjsd import (
+    available_backends,
+    jsd,
+    jsd_matrix,
+    jsd_pairwise,
+    jsd_pdist,
+    to_similarity,
+)
 
 
 def test_zero_diagonal_and_symmetry(backend):
@@ -22,10 +29,10 @@ def test_bounded_in_unit_interval_base_two(backend):
 
 
 def test_disjoint_supports_are_exactly_one(backend):
-    """Maximum divergence, on the one-hot case, where it is exact.
+    """Maximum divergence, on the one-hot case.
 
-    Only ever assert this for weights that are powers of two -- see the test
-    below, which is the honest statement of the property.
+    The simplest instance of G6 in `docs/MATH.md`; the test below covers
+    weights that are not powers of two.
     """
     P = np.eye(6)
     D = jsd_matrix(P, backend=backend)
@@ -33,20 +40,19 @@ def test_disjoint_supports_are_exactly_one(backend):
     assert np.all(off == 1.0)
 
 
-def test_disjoint_supports_are_one_to_within_two_ulp(backend):
-    """The general statement, because exactness here is a coincidence.
+def test_disjoint_supports_are_exactly_one_for_any_weights(backend):
+    """G6: exactly 1.0 -- not merely to within an ULP -- whatever the weights.
 
-    `np.eye(n)` puts weight 1.0 on one coordinate, and `bench/accuracy.py`'s
-    disjoint regime uses `w = max(1, k//n)` uniform weights -- both land on
-    powers of two, for which `SUM_c a_c ln a_c` happens to round to exactly
-    `-S_i ln 2`. With ordinary non-uniform weights it does not: 4.1 % of pairs
-    on the sparse kernels and 27.1 % on `numba-svml` come back 1-2 ULP low.
-    Row sums are exactly 1.0 throughout, so the residue comes from the
-    coordinate summation, not from normalization.
+    No logarithm is evaluated on a disjoint pair. Each row's one-sided mass is
+    accumulated on its own, in stored column order, and `prepare` has snapped
+    that order's total to exactly 1.0, so the pair's one-sided mass is exactly
+    2.0 and `0.5 * ln2 * 2.0 / ln2` rounds to 1.0. Drop any one of those -- the
+    snap, the per-row accumulators, or keeping one-sided coordinates out of
+    the general summand -- and 12-26 of these 132 pairs miss it.
 
-    G4 (duplicate rows give exactly 0.0) is a real bitwise cancellation and is
-    asserted exactly. This one is not, and pinning it as exact would only
-    encode the fixtures that happen to be chosen here.
+    The weights are deliberately not powers of two. An engine from before the
+    release missed on 4-27 % of such pairs, and this test used to accept a
+    2-eps band because of it.
     """
     rng = np.random.default_rng(31)
     n, w = 12, 5                       # 5 is not a power of two, which is the point
@@ -54,9 +60,41 @@ def test_disjoint_supports_are_one_to_within_two_ulp(backend):
     for r in range(n):
         P[r, r * w:(r + 1) * w] = rng.dirichlet(np.ones(w))
     D = jsd_matrix(P, backend=backend)
-    off = D[~np.eye(n, dtype=bool)]
-    assert np.all(np.abs(off - 1.0) <= 2 * np.finfo(np.float64).eps)
-    assert np.all(off <= 1.0), "the metric bound must hold whatever the rounding"
+    assert np.all(D[~np.eye(n, dtype=bool)] == 1.0)
+    assert np.all(jsd_pdist(P, backend=backend) == 1.0)
+    assert np.all(jsd_matrix(P[:5], P[5:], backend=backend) == 1.0)
+
+
+def test_pairwise_shares_the_matrix_guarantees():
+    """`jsd_pairwise` and `jsd` get G4 and G6 too, and symmetry.
+
+    They used to evaluate the general summand on one-sided coordinates and
+    total it with `np.sum`, so 15 % of disjoint pairs missed 1.0 -- some above
+    it, which made `to_similarity` negative -- and `jsd(p, q)` could differ
+    from `jsd(q, p)` in the last bit.
+    """
+    rng = np.random.default_rng(31)
+    n, w = 12, 5
+    P = np.zeros((n, n * w))
+    for r in range(n):
+        P[r, r * w:(r + 1) * w] = rng.dirichlet(np.ones(w))
+    i, j = np.nonzero(~np.eye(n, dtype=bool))
+    d = jsd_pairwise(P[i], P[j])
+    assert np.all(d == 1.0)
+    assert jsd(P[0], P[1]) == 1.0
+    row = dirichlet(1, 33, 0.3, seed=5)
+    assert np.all(jsd_pairwise(np.repeat(row, 4, axis=0), row) == 0.0)
+    A, B = dirichlet(40, 21, 0.3, seed=6), dirichlet(40, 21, 0.3, seed=7)
+    assert np.array_equal(jsd_pairwise(A, B), jsd_pairwise(B, A))
+
+
+def test_pairwise_is_the_numpy_kernel_row_by_row():
+    """Same arithmetic as `_numpy._block`, so the same bits as the diagonal
+    of the NumPy cross matrix -- on input with no all-zero column, which
+    `jsd_matrix` would drop and so sum in a different association."""
+    A, B = dirichlet(30, 19, 0.5, seed=8), dirichlet(30, 19, 0.5, seed=9)
+    assert np.array_equal(jsd_pairwise(A, B),
+                          np.diag(jsd_matrix(A, B, backend="numpy")))
 
 
 @pytest.mark.parametrize("k,alpha,seed", [(12, 0.3, 22), (25, 0.1, 220),

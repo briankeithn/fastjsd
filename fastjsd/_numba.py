@@ -42,6 +42,23 @@ def available() -> bool:
     return _HAVE
 
 
+_BYTE_BITS = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+def _bitcount_by_bytes(x):
+    """``np.bitwise_count`` for NumPy before 2.0, which added it.
+
+    Counts each byte through a 256-entry table and sums the bytes of each
+    element, so the result has the same shape, dtype and values.
+    """
+    x = np.ascontiguousarray(x)
+    per_byte = _BYTE_BITS[x.view(np.uint8)].reshape(*x.shape, x.itemsize)
+    return per_byte.sum(axis=-1, dtype=np.uint8)
+
+
+_bitcount = getattr(np, "bitwise_count", _bitcount_by_bytes)
+
+
 if _HAVE:
     _JIT = dict(parallel=True, cache=True, nogil=True, fastmath=False)
 
@@ -437,7 +454,7 @@ if _HAVE:
         a, b = a[keep], b[keep]
         if a.size == 0:
             return False
-        inter = np.bitwise_count(sig[a] & sig[b]).sum(axis=1)
+        inter = _bitcount(sig[a] & sig[b]).sum(axis=1)
         steps = np.where(inter > 0, z[a] + z[b] - 2 * inter, 0)
         # 1.5 sits between the synthetic cases measured on either side of
         # the crossover, with room on both sides. See the docstring for why
@@ -448,10 +465,10 @@ if _HAVE:
         """``rank[i, w]``: CSR position of the first stored column in word w.
 
         A prefix popcount along the words, offset by the row's CSR start.
-        Host-side, so ``np.bitwise_count`` is available here even though Numba
-        has no coverage for it.
+        Host-side, so ``_bitcount`` (``np.bitwise_count`` on NumPy 2) works
+        here even though Numba has no coverage for it.
         """
-        pc = np.bitwise_count(sig).astype(np.int64)
+        pc = _bitcount(sig).astype(np.int64)
         r = np.empty_like(pc)
         r[:, 0] = 0
         if pc.shape[1] > 1:
@@ -585,6 +602,48 @@ if _HAVE:
                 if not squared:
                     v = np.sqrt(v)
                 out[oi + j] = v
+
+    @njit(**_JIT)
+    def _dense_cross_flat(P, PL, Q, QL, inv, squared, out, wc):
+        """``_dense_cross`` scheduled over pairs instead of rows.
+
+        Same arithmetic in the same order -- only the owner of each pair
+        changes -- so the two are bitwise identical. A row loop hands out
+        ``n`` tasks, which leaves threads idle when ``n`` is below the thread
+        count: one query row against a large ``Q`` runs on a single core.
+        ``_use_flat_cross`` decides when that is the case.
+        """
+        n, k = P.shape
+        m_rows = Q.shape[0]
+        for pair in prange(n * m_rows):
+            i = pair // m_rows
+            j = pair - i * m_rows
+            acc = 0.0
+            onea = 0.0
+            oneb = 0.0
+            for c in range(k):
+                a = P[i, c]
+                b = Q[j, c]
+                if a > 0.0:
+                    if b > 0.0:
+                        sm = a + b
+                        m = 0.5 * sm
+                        if wc and abs(a - b) <= _TAU * sm:
+                            u2 = ((a - b) / sm) ** 2
+                            acc += m * u2 * _phi_over_u2(u2)
+                        else:
+                            acc += (PL[i, c] + QL[j, c]
+                                    - 2.0 * m * np.log(m))
+                    else:
+                        onea += a
+                elif b > 0.0:
+                    oneb += b
+            v = 0.5 * (acc + LN2 * (onea + oneb)) * inv
+            if v < 0.0:
+                v = 0.0
+            if not squared:
+                v = np.sqrt(v)
+            out[pair] = v
 
     @njit(**_JIT)
     def _sparse_self(data, indices, indptr, PL, rsum, sig, inv, squared,
@@ -826,6 +885,104 @@ if _HAVE:
                     v = np.sqrt(v)
                 out[oi + j] = v
 
+    @njit(**_JIT)
+    def _sparse_cross_flat(dp, ip, pp, PLp, rp, sp, dq, iq, pq, PLq, rq, sq,
+                           n, m_rows, inv, squared, out, wc):
+        """``_sparse_cross`` scheduled over pairs; see ``_dense_cross_flat``."""
+        nw = sp.shape[1]
+        for pair in prange(n * m_rows):
+            i = pair // m_rows
+            j = pair - i * m_rows
+            ai0 = pp[i]
+            ai1 = pp[i + 1]
+            si = rp[i]
+            acc = 0.0
+            hita = 0.0
+            hitb = 0.0
+            shared = False
+            for w in range(nw):
+                if sp[i, w] & sq[j, w]:
+                    shared = True
+                    break
+            if shared:
+                aj0 = pq[j]
+                aj1 = pq[j + 1]
+                pa = ai0
+                pb = aj0
+                while pa < ai1 and pb < aj1:
+                    ca = ip[pa]
+                    cb = iq[pb]
+                    if ca < cb:
+                        pa += 1
+                    elif cb < ca:
+                        pb += 1
+                    else:
+                        va = dp[pa]
+                        vb = dq[pb]
+                        s = va + vb
+                        m = 0.5 * s
+                        if wc and abs(va - vb) <= _TAU * s:
+                            u2 = ((va - vb) / s) ** 2
+                            acc += m * u2 * _phi_over_u2(u2)
+                        else:
+                            acc += PLp[pa] + PLq[pb] - 2.0 * m * np.log(m)
+                        hita += va
+                        hitb += vb
+                        pa += 1
+                        pb += 1
+            one = (si - hita) + (rq[j] - hitb)
+            v = 0.5 * (acc + LN2 * one) * inv
+            if v < 0.0:
+                v = 0.0
+            if not squared:
+                v = np.sqrt(v)
+            out[pair] = v
+
+    @njit(**_JIT)
+    def _sparse_cross_bits_flat(dp, PLp, rp, sp, ka, dq, PLq, rq, sq, kb,
+                                n, m_rows, inv, squared, out, wc):
+        """``_sparse_cross_bits`` scheduled over pairs; see ``_dense_cross_flat``."""
+        nw = sp.shape[1]
+        for pair in prange(n * m_rows):
+            i = pair // m_rows
+            j = pair - i * m_rows
+            si = rp[i]
+            acc = 0.0
+            hita = 0.0
+            hitb = 0.0
+            for w in range(nw):
+                gi = sp[i, w]
+                gj = sq[j, w]
+                mask = gi & gj
+                if mask == np.uint64(0):
+                    continue
+                ra = ka[i, w]
+                rb = kb[j, w]
+                while mask:
+                    bit = mask & (~mask + np.uint64(1))
+                    lo = bit - np.uint64(1)
+                    pa = ra + _popcount(gi & lo)
+                    pb = rb + _popcount(gj & lo)
+                    va = dp[pa]
+                    vb = dq[pb]
+                    sm = va + vb
+                    mm = 0.5 * sm
+                    if wc and abs(va - vb) <= _TAU * sm:
+                        u2 = ((va - vb) / sm) ** 2
+                        acc += mm * u2 * _phi_over_u2(u2)
+                    else:
+                        acc += PLp[pa] + PLq[pb] - 2.0 * mm * np.log(mm)
+                    hita += va
+                    hitb += vb
+                    mask ^= bit
+            one = (si - hita) + (rq[j] - hitb)
+            v = 0.5 * (acc + LN2 * one) * inv
+            if v < 0.0:
+                v = 0.0
+            if not squared:
+                v = np.sqrt(v)
+            out[pair] = v
+
 
 # --------------------------------------------------------------------------
 # host-side wrappers
@@ -885,6 +1042,20 @@ def csr_from_dense(P):
     return data, indices, indptr, xlogx_like_kernels(data)
 
 
+def _use_flat_cross(n, m):
+    """Schedule a cross matrix over pairs rather than rows?
+
+    Only when the row loop cannot occupy the threads: fewer rows in ``P`` than
+    Numba workers, and enough rows in ``Q`` (64) that the pairs are worth
+    spreading. Everything else keeps the row loop, which reuses row ``i`` from
+    cache across its whole output row. The two schedules return the same bits,
+    so this decides speed only. Dense kernel time at 4 threads, measured: 3.7x
+    faster for one query row against 20000 (k=64), 2.6x for 3 against 4096
+    (k=128), 1.2x for 2 against 2048 (k=256); no change at 1 thread.
+    """
+    return n < numba.get_num_threads() and m >= 64
+
+
 def matrix(P, Q, inv, squared, out, wc=False):
     n = P.shape[0]
     PL = xlogx_like_kernels(P)
@@ -898,8 +1069,8 @@ def matrix(P, Q, inv, squared, out, wc=False):
     m = Q.shape[0]
     if out is None:
         out = np.empty((n, m), dtype=P.dtype)
-    _dense_cross(P, PL, Q, xlogx_like_kernels(Q), inv, squared,
-                 out.reshape(-1), wc)
+    kernel = _dense_cross_flat if _use_flat_cross(n, m) else _dense_cross
+    kernel(P, PL, Q, xlogx_like_kernels(Q), inv, squared, out.reshape(-1), wc)
     return out
 
 
@@ -936,16 +1107,18 @@ def matrix_sparse(P, Q, inv, squared, out, wc=False):
         out = np.empty((n, m), dtype=P.dtype)
     sp = _signatures(idx, ptr, P.shape[1])
     sq = _signatures(iq, pq, Q.shape[1])
+    flat = _use_flat_cross(n, m)
     if (_unfolded(P.shape[1]) and _unfolded(Q.shape[1])
             and _prefer_bits(sp, ptr)):
-        _sparse_cross_bits(data, PL, _row_sums(data, ptr), sp,
-                           _ranks(sp, ptr),
-                           dq, PLq, _row_sums(dq, pq), sq, _ranks(sq, pq),
-                           n, m, inv, squared, out.reshape(-1), wc)
+        kernel = _sparse_cross_bits_flat if flat else _sparse_cross_bits
+        kernel(data, PL, _row_sums(data, ptr), sp, _ranks(sp, ptr),
+               dq, PLq, _row_sums(dq, pq), sq, _ranks(sq, pq),
+               n, m, inv, squared, out.reshape(-1), wc)
     else:
-        _sparse_cross(data, idx, ptr, PL, _row_sums(data, ptr), sp,
-                      dq, iq, pq, PLq, _row_sums(dq, pq), sq,
-                      n, m, inv, squared, out.reshape(-1), wc)
+        kernel = _sparse_cross_flat if flat else _sparse_cross
+        kernel(data, idx, ptr, PL, _row_sums(data, ptr), sp,
+               dq, iq, pq, PLq, _row_sums(dq, pq), sq,
+               n, m, inv, squared, out.reshape(-1), wc)
     return out
 
 

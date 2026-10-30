@@ -3,7 +3,9 @@ import pytest
 
 from fastjsd import available_backends
 
-BACKENDS = list(available_backends())
+# numba-f32 computes in float32, so the float64 tolerances these tests assert
+# do not apply to it; tests/test_f32.py holds its versions of the properties.
+BACKENDS = [b for b in available_backends() if b != "numba-f32"]
 
 
 @pytest.fixture(params=BACKENDS)

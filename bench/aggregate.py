@@ -41,6 +41,12 @@ Configurations are partitioned before anything is combined.
     can be slower than SciPy. That is an honest finding and it gets its own
     section; pooling it into the headline range would destroy both claims.
 
+numba-f32 gets a section of its own.
+    Its ratio is numba / numba-f32 on the same float32 rows -- a claim about
+    the float32 kernel, not about fastjsd against a baseline -- so it is
+    counted and printed apart, under the same rules: the box as the unit, the
+    geometric mean, and any loss in the headline.
+
 Boxes that graded themselves `unusable` are dropped, and the exclusion is
 printed. A silently dropped box is worse than a bad one.
 """
@@ -54,16 +60,22 @@ import math
 import pathlib
 import sys
 
-SCHEMA = "fastjsd-crossmachine/1"
+SCHEMA = "fastjsd-crossmachine/2"
 
 #: The summary this file writes carries its OWN schema, so that re-running the
 #: aggregation over a directory it has already written to cannot read its own
 #: output back in as though it were a leg -- which is what sharing `SCHEMA`
 #: between the two would allow.
-SUMMARY_SCHEMA = "fastjsd-crossmachine-summary/1"
+SUMMARY_SCHEMA = "fastjsd-crossmachine-summary/2"
 
 #: The subject. Every ratio in a leg is <baseline> / <this>.
 SUBJECT = "fastjsd auto"
+
+#: The leg's `f32` section: numba-f32 timed against the float64 dense kernel on
+#: the same float32 rows. Same orientation, <baseline> / <subject>, and a claim
+#: of its own, so it is combined and reported in a section of its own.
+F32_SUBJECT = "numba-f32"
+F32_BASELINE = "numba"
 
 
 def geomean(values):
@@ -169,9 +181,9 @@ def crosscheck(leg):
     ``[min_t b_t/f_t, max_t b_t/f_t]``. If it does not, the `ms` arrays and the
     `ratios` block did not come from the same measurements.
 
-    The bracket is checked with a relative slack, because the leg rounds both
-    the times and the ratios before writing them, and a bound that fired on the
-    fourth decimal place would flag every honest file.
+    The bracket is checked with a relative slack, because the leg rounds the
+    times before writing them (to the nanosecond, `portable.MS_DIGITS`), and a
+    bound that fired on the last decimal place would flag honest files.
     """
     notes = []
     slack = 1e-3
@@ -200,6 +212,29 @@ def crosscheck(leg):
                     f"{leg['leg_id']}/{row['case']}: {name} ratio block "
                     f"[{lo:.3f}, {hi:.3f}] does not bracket ms_min ratio "
                     f"{got:.3f} -- arrays and ratios disagree")
+    for row in (leg.get("f32") or {}).get("cases", []):
+        where = f"{leg['leg_id']}/{row.get('case')}"
+        if row.get("status") != "ok":
+            notes.append(f"{where}: {F32_SUBJECT} did not run "
+                         f"({row.get('reason')})")
+            continue
+        if row.get("agrees") is False:
+            notes.append(f"{where}: {F32_SUBJECT} disagreed with the float64 "
+                         f"kernel ({row.get('max_abs_err')}); its timing "
+                         f"measures a different function")
+        impls, ratio = row.get("impls", {}), row.get("ratio") or {}
+        try:
+            got = (impls[F32_BASELINE]["ms_min"]
+                   / impls[F32_SUBJECT]["ms_min"])
+            lo, hi = ratio["min"], ratio["max"]
+        except (KeyError, TypeError, ZeroDivisionError):
+            notes.append(f"{where}: {F32_SUBJECT} row has no usable timing")
+            continue
+        if not (lo * (1 - slack) <= got <= hi * (1 + slack)):
+            notes.append(
+                f"{where}: {F32_SUBJECT} ratio block [{lo:.3f}, {hi:.3f}] does "
+                f"not bracket ms_min ratio {got:.3f} -- arrays and ratios "
+                f"disagree")
     return notes
 
 
@@ -225,6 +260,29 @@ def cells(legs):
                     "n": row.get("n"), "k": row.get("k"),
                     "density": row.get("density"),
                 })
+    return out
+
+
+def f32_cells(legs):
+    """One record per (box, case) of the `f32` section, shaped like `cells`.
+
+    Shaped alike so `per_case`, `per_box` and `verdict` apply unchanged: the
+    rules that keep the main comparison honest -- the box as the unit, the
+    geometric mean, a loss as the headline -- hold for this claim too.
+    """
+    out = []
+    for leg in legs:
+        for row in (leg.get("f32") or {}).get("cases", []):
+            r = row.get("ratio")
+            if row.get("status") != "ok" or not r:
+                continue
+            out.append({
+                "leg": leg["leg_id"], "case": row["case"],
+                "baseline": F32_BASELINE, "median": r["median"],
+                "min": r["min"], "max": r["max"],
+                "resolvable": bool(r.get("resolvable", False)),
+                "n": row.get("n"), "k": row.get("k"), "density": None,
+            })
     return out
 
 
@@ -296,18 +354,18 @@ def verdict(cs, baseline):
     }
 
 
-def sentence(v):
+def sentence(v, subject="fastjsd"):
     """The one line a reader is most likely to quote."""
     if v is None:
         return ""
     name = v["baseline"]
     if v["cells_lost"]:
-        head = (f"fastjsd was SLOWER than {name} in {v['cells_lost']} of "
+        head = (f"{subject} was SLOWER than {name} in {v['cells_lost']} of "
                 f"{v['n_cells']} case-box cells "
                 f"({v['boxes_won']}/{v['n_boxes']} boxes still had a per-box "
                 f"geomean above 1)")
     else:
-        head = (f"fastjsd was faster than {name} on {v['boxes_won']}/"
+        head = (f"{subject} was faster than {name} on {v['boxes_won']}/"
                 f"{v['n_boxes']} boxes and {v['cells_won']}/{v['n_cells']} "
                 f"case-box pairs")
     lo, hi = v["range"]
@@ -364,6 +422,24 @@ def report_losses(summary, emit):
         emit("no losing cells: fastjsd was at least as fast as every baseline")
         emit("on every box and every case in this set.")
         emit("")
+    f32 = summary.get("f32")
+    f32_losses = f32["verdict"]["losses"] if f32 else []
+    if f32_losses:
+        title = (f"LOSSES: {F32_SUBJECT} was SLOWER than {F32_BASELINE} in "
+                 f"{plural(len(f32_losses), 'case-box cell')}")
+        emit(bar(title))
+        emit(title)
+        emit(bar(title))
+        emit("")
+        emit(f"{'box':16}{'ratio':>8}  case")
+        for loss in sorted(f32_losses, key=lambda x: x["ratio"]):
+            emit(f"{loss['leg']:16}{loss['ratio']:>7.2f}x  {loss['case']}")
+        emit("")
+        emit(f"The 0.2.0 claim is that {F32_SUBJECT} is faster than "
+             f"{F32_BASELINE} on dense")
+        emit("float32 input. On these boxes it was not, and the range in its")
+        emit("section below contains these cells.")
+        emit("")
     if unresolved:
         emit(f"INDISTINGUISHABLE: {plural(len(unresolved), 'cell')} whose "
              "across-repeat ratio")
@@ -372,6 +448,59 @@ def report_losses(summary, emit):
             emit(f"  {u['leg']:16}{u['baseline']:24}"
                  f"[{u['min']:.2f}x, {u['max']:.2f}x]  {u['case']}")
         emit("")
+
+
+def report_f32(summary, emit):
+    """numba-f32 against numba: the 0.2.0 claim, in its own section."""
+    f32 = summary.get("f32")
+    title = (f"{F32_SUBJECT} vs {F32_BASELINE}   (dense cases, float32 input "
+             f"for both)")
+    emit(bar(title, "="))
+    if not f32:
+        emit(title)
+        emit(bar(title, "="))
+        emit("no leg produced a comparable cell: numba-f32 was absent or failed")
+        emit("on every box (each leg's 'f32' block says why).")
+        emit("")
+        return
+    emit(f"{title}   ({plural(f32['n_boxes'], 'box')})")
+    emit(f"ratio = {F32_BASELINE} / {F32_SUBJECT}: above 1.0, the float32 "
+         "kernel was faster on that box.")
+    emit(bar(title, "="))
+    emit("")
+    emit(f"{'case':34}{'min':>8}{'worst box':>16}"
+         f"{'median':>9}{'max':>9}{'boxes':>7}{'resolv':>8}")
+    emit("-" * 91)
+    for row in f32["per_case"]:
+        emit(f"{row['case'][:33]:34}{row['min']:>7.2f}x"
+             f"{row['min_box']:>16}{row['median']:>8.2f}x"
+             f"{row['max']:>8.2f}x{row['n_boxes']:>7}"
+             f"{row['n_resolvable']:>5}/{row['n_boxes']}")
+    v = f32["verdict"]
+    emit("")
+    emit("per-box geometric mean over cases:")
+    for leg, gm in sorted(v["per_box_geomean"].items(),
+                          key=lambda kv: kv[1] or 0.0):
+        emit(f"  {leg:16}{gm:>8.2f}x" if gm else f"  {leg:16}       -")
+    if v["indistinguishable"]:
+        emit("")
+        emit("indistinguishable cells (the across-repeat spread straddles 1.0):")
+        for u in v["indistinguishable"]:
+            emit(f"  {u['leg']:16}[{u['min']:.2f}x, {u['max']:.2f}x]  "
+                 f"{u['case']}")
+    emit("")
+    emit("  " + sentence(v, subject=F32_SUBJECT))
+    acc = summary.get("f32_accuracy") or {}
+    if acc:
+        emit("")
+        emit(f"{F32_SUBJECT} against 50-digit truth of its float32-rounded "
+             "input, worst over boxes")
+        emit("(deterministic -- the caveats on timing do not apply):")
+        for regime, a in acc.items():
+            where = f" ({a['worst_abs_box']})" if a["worst_abs"] > 0 else ""
+            emit(f"  {regime:18}abs {a['worst_abs']:.1e}{where}"
+                 f"   rel {a['worst_rel']:.1e}   {plural(a['n_boxes'], 'box')}")
+    emit("")
 
 
 def report(summary, emit):
@@ -435,6 +564,8 @@ def report(summary, emit):
             emit("  " + sentence(v))
         emit("")
 
+    report_f32(summary, emit)
+
     emit("consistency verdict")
     emit("-" * 88)
     for line in summary["verdict_lines"]:
@@ -458,6 +589,14 @@ def report(summary, emit):
             emit(f"  {leg}: {', '.join(impls)}")
         emit("  This is deterministic and does NOT depend on runner noise. It is")
         emit("  a real portability defect in the guarantee, not a measurement.")
+        emit("")
+    if summary["disjoint_failures"]:
+        emit("EXACTNESS FAILURE -- disjoint supports did not come back exactly "
+             "1.0:")
+        for leg, impls in summary["disjoint_failures"].items():
+            emit(f"  {leg}: {', '.join(impls)}")
+        emit("  Deterministic, like the zero check: a real portability defect in")
+        emit("  the guarantee (docs/MATH.md G6), not a measurement.")
         emit("")
     emit("caveats, carried from the legs and reprinted with the numbers:")
     for c in summary["caveats"]:
@@ -515,18 +654,51 @@ def build(legs):
             hashes.setdefault(row["case"], set()).add(row.get("input_sha256"))
     mismatch = {c: sorted(h) for c, h in hashes.items() if len(h) > 1}
 
-    failures = {}
+    # Deterministic checks are read from EVERY leg, excluded ones included:
+    # runner noise cannot touch them, so a box too noisy to time is still a
+    # box whose exactness result stands.
+    failures, disjoint = {}, {}
     for leg in legs:
-        acc = leg.get("accuracy", {}).get("duplicate_rows_exact_zero", {})
-        bad = [nm for nm, ok in acc.items() if nm.startswith("fastjsd") and not ok]
-        if bad:
-            failures[leg["leg_id"]] = bad
+        acc = leg.get("accuracy", {})
+        for key, out in (("duplicate_rows_exact_zero", failures),
+                         ("disjoint_supports_exact_one", disjoint)):
+            bad = [nm for nm, ok in acc.get(key, {}).items()
+                   if nm.startswith("fastjsd") and not ok]
+            if bad:
+                out[leg["leg_id"]] = bad
+
+    # The f32 claim is a numba claim: a leg without numba has no f32 section.
+    fc = f32_cells([x for x in kept if has_numba(x)])
+    f32 = None
+    if fc:
+        f32 = {"n_boxes": len({c["leg"] for c in fc}),
+               "verdict": verdict(fc, F32_BASELINE),
+               "per_case": per_case(fc, F32_BASELINE)}
+
+    f32_acc = {}
+    for leg in legs:
+        per = (leg.get("accuracy", {}).get("vs_mpmath") or {}).get(
+            "per_regime", {})
+        for regime, backends in per.items():
+            e = backends.get(F32_SUBJECT)
+            if not e:
+                continue
+            a = f32_acc.setdefault(regime, {"worst_abs": -1.0,
+                                            "worst_abs_box": None,
+                                            "worst_rel": 0.0, "n_boxes": 0})
+            a["n_boxes"] += 1
+            a["worst_rel"] = max(a["worst_rel"], e["rel"])
+            if e["abs"] > a["worst_abs"]:
+                a["worst_abs"], a["worst_abs_box"] = e["abs"], leg["leg_id"]
 
     lines = []
     for config, section in configurations.items():
         for v in section["verdicts"].values():
             prefix = "" if config == "numba" else "[numpy-only] "
             lines.append(prefix + sentence(v))
+    if f32:
+        lines.append(f"[{F32_SUBJECT}] "
+                     + sentence(f32["verdict"], subject=F32_SUBJECT))
     if not lines:
         lines.append("no comparable cells: every leg is missing ratios.")
 
@@ -541,7 +713,8 @@ def build(legs):
             "excluded": excluded, "suspect": suspect, "problems": problems,
             "configurations": configurations, "verdict_lines": lines,
             "input_hash_mismatch": mismatch, "exactness_failures": failures,
-            "caveats": caveats}
+            "disjoint_failures": disjoint, "f32": f32,
+            "f32_accuracy": f32_acc, "caveats": caveats}
 
 
 def main():
