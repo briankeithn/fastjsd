@@ -32,10 +32,13 @@ name: cross-machine benchmark (manual)
 #     so clock rate and core count divide out. Reported with its own spread and
 #     as "indistinguishable" whenever that spread straddles 1.0.
 #   * The exactness guarantees, which are deterministic and DO travel: accuracy
-#     against 50-digit mpmath, and duplicate rows giving exactly 0.0. That last
-#     depends on a bitwise cancellation, which is a property of one libm and one
-#     code generator until checked against another. These are the highest-value
-#     output of the whole exercise.
+#     against 50-digit mpmath, duplicate rows giving exactly 0.0 and disjoint
+#     supports exactly 1.0. The zero depends on a bitwise cancellation, which is
+#     a property of one libm and one code generator until checked against
+#     another. These are the highest-value output of the whole exercise.
+#   * Whether numba-f32 beats the float64 dense kernel on each box. Both run in
+#     the same harness on the same float32 rows, so the ratio travels like the
+#     Lee-1997 one; what it tests is whether the box vectorizes the float32 loop.
 #   * Whether the package degrades correctly where numba, scipy or a wheel is
 #     simply absent.
 #
